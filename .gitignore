@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Local phase-server runtime cache (cycle_api.json)
+cache/
+
 # C extensions
 *.so
 

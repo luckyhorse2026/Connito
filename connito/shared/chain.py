@@ -409,6 +409,29 @@ def get_chain_commits(
     return parsed
 
 
+def _connect_subtensor_with_retry(network, *, retries: int = 30, backoff_s: int = 5):
+    """Open a Subtensor connection, retrying on transient handshake/RPC errors.
+
+    The public archive endpoint intermittently times out the websocket
+    handshake (esp. under many connections from one host). Without this, a
+    single timeout during worker startup raises uncaught and kills the process;
+    PM2 restarts it and the phase scheduler resets, so the worker can miss its
+    commit window. Retrying keeps the process alive until the endpoint recovers.
+    """
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return bittensor.Subtensor(network=network)
+        except Exception as e:  # noqa: BLE001 — handshake timeouts surface as several types
+            last_err = e
+            logger.warning(
+                "Subtensor connect failed; retrying",
+                network=network, attempt=attempt, max_retries=retries, error=str(e),
+            )
+            time.sleep(min(backoff_s * attempt, 60))
+    raise last_err
+
+
 # --- setup chain worker ---
 def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
     """Create the chain connections this worker needs.
@@ -423,7 +446,7 @@ def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
     wallet = bittensor.Wallet(name=config.chain.coldkey_name, hotkey=config.chain.hotkey_name)
     if subtensor is None:
         logger.debug("setup_chain_worker: creating archive Subtensor connection", network=config.chain.network)
-        subtensor = bittensor.Subtensor(network=config.chain.network)
+        subtensor = _connect_subtensor_with_retry(config.chain.network)
     else:
         logger.debug("setup_chain_worker: reusing existing archive Subtensor connection", network=config.chain.network)
 
@@ -431,7 +454,7 @@ def setup_chain_worker(config, subtensor=None, lite_subtensor=None, serve=True):
         lite_network = config.chain.lite_network
         if lite_network and lite_network != config.chain.network:
             logger.debug("setup_chain_worker: creating lite Subtensor connection", lite_network=lite_network)
-            lite_subtensor = bittensor.Subtensor(network=lite_network)
+            lite_subtensor = _connect_subtensor_with_retry(lite_network)
         else:
             # lite_network explicitly matches archive — single connection.
             lite_subtensor = subtensor

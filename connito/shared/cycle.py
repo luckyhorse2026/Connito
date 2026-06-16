@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -133,6 +135,197 @@ def _get_with_retry(
 
     logger.error("Request failed after retries", url=url, total_attempts=retries + 1)
     return None
+
+
+# --- Owner cycle-API shared cache ----------------------------------------
+# Running many miners on one host means many processes polling the owner phase
+# API, which trips its rate limit. Instead one "phase oracle" process (started
+# with CONNITO_CYCLE_ORACLE=1, see connito/shared/phase_oracle.py) performs the
+# network fetches and writes every response to a shared JSON file; all other
+# processes read that file and never touch the network while it is fresh.
+#
+# Env knobs (all optional):
+#   CONNITO_CYCLE_ORACLE=1            -> this process fetches over the network
+#                                        and writes the cache (the oracle).
+#   CONNITO_CYCLE_CACHE=<path>        -> override the cache file location.
+#   CONNITO_CYCLE_CACHE_MAX_AGE=<s>   -> reader freshness window (default 30s).
+#   CONNITO_CYCLE_CACHE_FALLBACK=auto|never|always
+#       auto (default): serve fresh cache; on a stale/missing entry fall back
+#           to the network ONLY when no cache file exists at all (i.e. there is
+#           no oracle on this host) — so a standalone miner still works, while
+#           a multi-miner host with an oracle keeps readers off the network.
+#       never:  cache-only; return None when not fresh (readers never call out).
+#       always: always fall back to the network when the cache is not fresh.
+_CYCLE_ORACLE_ENV = "CONNITO_CYCLE_ORACLE"
+_CYCLE_CACHE_ENV = "CONNITO_CYCLE_CACHE"
+_CYCLE_CACHE_MAX_AGE_ENV = "CONNITO_CYCLE_CACHE_MAX_AGE"
+_CYCLE_CACHE_FALLBACK_ENV = "CONNITO_CYCLE_CACHE_FALLBACK"
+_DEFAULT_CACHE_MAX_AGE = 30.0
+
+
+def _is_cycle_oracle() -> bool:
+    return os.environ.get(_CYCLE_ORACLE_ENV, "") == "1"
+
+
+def _cycle_cache_path(config: WorkerConfig) -> Path:
+    override = os.environ.get(_CYCLE_CACHE_ENV)
+    if override:
+        return Path(override)
+    return Path(config.run.root_path) / "cache" / "cycle_api.json"
+
+
+def _cycle_cache_max_age() -> float:
+    try:
+        return float(os.environ.get(_CYCLE_CACHE_MAX_AGE_ENV, _DEFAULT_CACHE_MAX_AGE))
+    except ValueError:
+        return _DEFAULT_CACHE_MAX_AGE
+
+
+def _cache_read_entry(path: Path, url: str, max_age: float) -> tuple[Any | None, bool]:
+    """Return (fresh_body, file_exists).
+
+    fresh_body is the cached payload when an entry for `url` exists and is
+    within `max_age`; otherwise None. file_exists reflects whether the cache
+    file is present at all (used to decide network fallback).
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None, path.exists()
+    entry = data.get(url)
+    if not isinstance(entry, dict):
+        return None, True
+    if time.time() - float(entry.get("ts", 0)) > max_age:
+        return None, True
+    return entry.get("body"), True
+
+
+def _cache_write_entry(path: Path, url: str, body: Any) -> None:
+    """Merge {url: {ts, body}} into the cache file via an atomic rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data[url] = {"ts": time.time(), "body": body}
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _get_json(config: WorkerConfig, url: str) -> Any | None:
+    """GET JSON from the owner cycle API through the shared cache.
+
+    Oracle process (CONNITO_CYCLE_ORACLE=1): always fetch over the network and
+    write the cache. Reader process: serve fresh cache; otherwise fall back to
+    the network per CONNITO_CYCLE_CACHE_FALLBACK (see module note above).
+    Returns the parsed JSON body, or None on miss/failure.
+    """
+    oracle = _is_cycle_oracle()
+    cache_path = _cycle_cache_path(config)
+
+    if not oracle:
+        body, file_exists = _cache_read_entry(cache_path, url, _cycle_cache_max_age())
+        if body is not None:
+            return body
+        mode = os.environ.get(_CYCLE_CACHE_FALLBACK_ENV, "auto").lower()
+        if mode == "never":
+            return None
+        if mode != "always" and file_exists:
+            # auto + an oracle is managing the cache: don't flood the API,
+            # let the caller's retry loop re-read once the oracle refreshes.
+            return None
+
+    resp = _get_with_retry(
+        url,
+        timeout=config.cycle.api_timeout_sec,
+        retries=config.cycle.api_retries,
+        backoff=config.cycle.api_backoff_sec,
+    )
+    if resp is None:
+        return None
+    try:
+        body = resp.json()
+    except ValueError as e:
+        logger.exception("Invalid JSON from %s: %s", url, e)
+        return None
+    if oracle:
+        try:
+            _cache_write_entry(cache_path, url, body)
+        except OSError as e:
+            logger.warning("Failed to write cycle cache", url=url, error=str(e))
+    return body
+
+
+# --- Live phase-period override ------------------------------------------
+# cycle.*_period are LOCKED config fields pinned to the repo defaults, but the
+# owner's live deployment can run different values (e.g. commit_period=11,
+# submission_period=100 -> cycle_length 524, not the repo's 500). Editing the
+# YAML won't stick (the loader reverts locked fields), so the local phase
+# oracle/server apply the real periods in-memory AFTER load, from a small JSON
+# file. Keep this file in sync with the owner's /blocks_until_next_phase.
+_PHASE_PERIODS_ENV = "CONNITO_PHASE_PERIODS"
+_PHASE_PERIOD_FIELDS = (
+    "distribute_period",
+    "train_period",
+    "commit_period",
+    "submission_period",
+    "validate_period",
+    "merge_period",
+)
+
+
+def _phase_periods_path(config: WorkerConfig) -> Path:
+    override = os.environ.get(_PHASE_PERIODS_ENV)
+    if override:
+        return Path(override)
+    return Path(config.run.root_path) / "phase_periods.json"
+
+
+def apply_phase_period_overrides(config: WorkerConfig) -> dict[str, int]:
+    """Override the locked cycle.*_period fields in-memory so local PhaseManager
+    math matches the owner's LIVE schedule. Reads a JSON map of
+    {period_field: blocks}; no-op (returns {}) if the file is absent/unreadable.
+    """
+    path = _phase_periods_path(config)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    applied: dict[str, int] = {}
+    for field in _PHASE_PERIOD_FIELDS:
+        if field in data:
+            value = int(data[field])
+            setattr(config.cycle, field, value)
+            applied[field] = value
+    if applied:
+        logger.info("Applied live phase-period overrides", path=str(path), **applied)
+    return applied
+
+
+# owner_url is a LOCKED field pinned to the Cloudflare-blocked owner API. Set
+# CONNITO_OWNER_URL to redirect every cycle-API call to a reachable host (e.g.
+# a local phase server at http://127.0.0.1:8088). Applied in-memory after load.
+_OWNER_URL_ENV = "CONNITO_OWNER_URL"
+
+
+def apply_owner_url_override(config: WorkerConfig) -> str | None:
+    """Override the locked cycle.owner_url in-memory from CONNITO_OWNER_URL so
+    cycle-API requests target a reachable host. Returns the new URL or None."""
+    url = os.environ.get(_OWNER_URL_ENV)
+    if not url:
+        return None
+    url = url.rstrip("/")
+    config.cycle.owner_url = url
+    logger.info("Applied owner_url override", owner_url=url)
+    return url
+
 
 class PhaseResponseLite(BaseModel):
     phase_name: str
@@ -737,12 +930,12 @@ def get_phase_from_api(config: WorkerConfig) -> PhaseResponse | None:
     base_url = config.cycle.owner_url
     url = f"{base_url}/get_phase"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
+    body = _get_json(config, url)
+    if body is None:
         return None
 
     try:
-        return PhaseResponse(**resp.json())
+        return PhaseResponse(**body)
     except (ValueError, TypeError) as e:
         # ValueError: JSON decode problems
         # TypeError: PhaseResponse(**...) got unexpected/missing fields
@@ -760,16 +953,7 @@ def get_blocks_until_next_phase_from_api(config: WorkerConfig) -> dict[str, tupl
     base_url = config.cycle.owner_url
     url = f"{base_url}/blocks_until_next_phase"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as e:
-        # JSON decoding failed
-        logger.exception("Invalid JSON from %s: %s", url, e)
-        return None
+    return _get_json(config, url)
 
 
 def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None:
@@ -782,38 +966,23 @@ def get_blocks_from_previous_phase_from_api(config: WorkerConfig) -> dict | None
     base_url = config.cycle.owner_url
     url = f"{base_url}/previous_phase_blocks"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as e:
-        # JSON decoding failed
-        logger.exception("Invalid JSON from %s: %s", url, e)
-        return None
+    return _get_json(config, url)
 
 def get_validator_whitelist_from_api(config) -> set[str]:
     """Fetch the validator whitelist from the owner phase service."""
     base_url = config.cycle.owner_url
     url = f"{base_url}/get_validator_whitelist"
 
-    resp = _get_with_retry(
-        url,
-        timeout=config.cycle.api_timeout_sec,
-        retries=config.cycle.api_retries,
-        backoff=config.cycle.api_backoff_sec,
-    )
-    if resp is None:
+    hotkeys = _get_json(config, url)
+    if hotkeys is None:
         logger.warning("Failed to fetch validator whitelist from owner API")
         return set()
 
     try:
-        hotkeys = resp.json()
         logger.debug("fetched validator whitelist", count=len(hotkeys))
         return set(hotkeys)
-    except (ValueError, TypeError) as e:
-        logger.exception("Invalid JSON from %s: %s", url, e)
+    except TypeError as e:
+        logger.exception("Invalid whitelist payload from %s: %s", url, e)
         return set()
 def get_allowed_version_range(config: WorkerConfig) -> tuple[int | None, int | None]:
     """
@@ -869,16 +1038,7 @@ def get_init_peer_id(config: WorkerConfig) -> str | None:
     base_url = config.cycle.owner_url
     url = f"{base_url}/get_init_peer_id"
 
-    resp = _get_with_retry(url, timeout=config.cycle.api_timeout_sec, retries=config.cycle.api_retries, backoff=config.cycle.api_backoff_sec)
-    if resp is None:
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as e:
-        # JSON decoding failed
-        logger.exception("Invalid JSON from %s: %s", url, e)
-        return None
+    return _get_json(config, url)
 
 def load_submission_files(folder: str = "miner_submission"):
     """

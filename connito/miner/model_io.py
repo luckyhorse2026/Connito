@@ -1,5 +1,8 @@
+import os
+import random
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 from queue import Queue
 from threading import Lock, Thread
 
@@ -24,7 +27,12 @@ from connito.shared.checkpoints import (
 from connito.shared.expert_manager import ExpertManager
 from connito.shared.config import MinerConfig, parse_args
 from connito.shared.chain import setup_chain_worker
-from connito.shared.cycle import PhaseResponse, check_phase_expired, wait_till
+from connito.shared.cycle import (
+    PhaseResponse,
+    check_phase_expired,
+    get_allowed_version_range,
+    wait_till,
+)
 from connito.shared.hf_distribute import (
     get_hf_upload_readiness,
     resolve_hf_repo_ids,
@@ -91,20 +99,36 @@ class FileNotReadyError(RuntimeError):
     pass
 
 
+def _skip_download() -> bool:
+    """Rotation-commit miners commit pre-downloaded models from ../models and
+    never use the validator model fetched during Distribute. Set
+    CONNITO_SKIP_DOWNLOAD=1 to skip the download phase entirely — this drops the
+    heavy per-cycle get_chain_commits archive query (the main chain-RPC load and
+    crash source) and only leaves the lightweight commit writes."""
+    return os.environ.get("CONNITO_SKIP_DOWNLOAD", "") == "1"
+
+
 # --- Scheduler service ---
 def scheduler_service(
     config,
     download_queue: Queue,
     commit_queue: Queue,
     poll_fallback_block: int = 3,
+    skip_download: bool = False,
 ):
     """
     Periodically checks whether to start download/commit phases and enqueues jobs.
     """
     while True:
         # --------- DOWNLOAD SCHEDULING ---------
+        # Always wait for Distribute first: it is the once-per-cycle gate that
+        # keeps the loop from re-triggering for the whole (multi-block)
+        # MinerCommit1 phase. In skip_download mode we still wait here (a cheap
+        # phase-timing poll) but don't enqueue a download job — only the heavy
+        # download WORK is skipped, not the cycle gate.
         phase_response = wait_till(config, phase_name=PhaseNames.distribute, poll_fallback_block=poll_fallback_block)
-        download_queue.put(Job(job_type=JobType.DOWNLOAD, phase_response=phase_response))
+        if not skip_download:
+            download_queue.put(Job(job_type=JobType.DOWNLOAD, phase_response=phase_response))
 
         # --------- COMISSION SCHEDULING ---------
         phase_response = wait_till(
@@ -193,27 +217,78 @@ def download_worker(
             logger.info(f"<{PhaseNames.distribute}> task completed.")
 
 
+# Directory holding the pre-downloaded HuggingFace model repos to rotate
+# through, one committed per cycle. Resolved as `../models` relative to the
+# project root (root_path is the repo dir; its parent holds `models/`).
+ROTATION_MODELS_DIRNAME = "models"
+
+
+def _rotation_models_dir(config) -> Path:
+    return Path(config.run.root_path).parent / ROTATION_MODELS_DIRNAME
+
+
+def _list_rotation_models(models_dir: Path) -> list[Path]:
+    """Return the model repo subdirectories under `models_dir`, sorted by name
+    so the first cycle deterministically picks `model0` (the first entry).
+    """
+    if not models_dir.exists():
+        return []
+    return sorted(p for p in models_dir.iterdir() if p.is_dir())
+
+
+def _select_rotation_model(models_dir: Path, previous: Path | None) -> Path:
+    """Pick the model to commit this cycle: a random model, excluding the one
+    committed in the immediately previous cycle.
+
+    First cycle (`previous is None`) is also random — nothing is excluded, so
+    every model is a candidate. If only one model exists it is reused regardless.
+    """
+    models = _list_rotation_models(models_dir)
+    if not models:
+        raise FileNotReadyError(f"No model directories under {models_dir}, skip commit.")
+    # previous is None on the first cycle -> `m != previous` keeps every model,
+    # so the first pick is random too. The `or models` fallback covers the
+    # single-model case where the only candidate is the previous one.
+    candidates = [m for m in models if m != previous] or models
+    return random.choice(candidates)
+
+
 def _prepare_checkpoint_for_commit(
     config,
     wallet,
     shared_state: SharedState,
-) -> ModelCheckpoint:
-    """Pick the latest local checkpoint, sign it, and publish the path to
-    shared state.
-    """
-    latest_checkpoint = select_best_checkpoint(
-        primary_dir=config.ckpt.checkpoint_path, resume=config.ckpt.resume_from_ckpt
-    )
-    if latest_checkpoint is None or latest_checkpoint.path is None:
-        raise FileNotReadyError("Not checkpoint found, skip commit.")
+    previous_model: Path | None,
+) -> tuple[ModelCheckpoint, Path]:
+    """Select the next model from the rotation directory, sign its hash, and
+    publish the path to shared state.
 
-    latest_checkpoint.expert_group = config.task.exp.group_id
+    Returns the signed checkpoint and the selected model directory (so the
+    caller can exclude it from next cycle's random pick).
+    """
+    models_dir = _rotation_models_dir(config)
+    selected = _select_rotation_model(models_dir, previous_model)
+
+    # Validators reject commits whose global_ver falls outside
+    # [phase_start - version_range_cycles * cycle_length, phase_start]. The
+    # rotated models carry no training version, so stamp them with the upper
+    # bound of that window (the current MinerCommit1 phase start block).
+    _min_ver, max_ver = get_allowed_version_range(config)
+    if max_ver is None:
+        raise FileNotReadyError("Could not resolve allowed version range, skip commit.")
+
+    latest_checkpoint = ModelCheckpoint(
+        path=selected,
+        expert_group=config.task.exp.group_id,
+        global_ver=max_ver,
+        role="miner",
+        place="local",
+    )
     latest_checkpoint.sign_hash(wallet=wallet)
 
     with shared_state.lock:
         shared_state.latest_checkpoint_path = latest_checkpoint.path
 
-    return latest_checkpoint
+    return latest_checkpoint, selected
 
 
 def _commit_signed_model_hash(
@@ -353,12 +428,16 @@ def commit_worker(
     shared_state: SharedState,
     subtensor=None,
 ):
-    """Consume COMMIT jobs. For each cycle: sign+publish the checkpoint hash
-    (miner_commit_1), upload to HF, then commit the hash+HF coords
-    (miner_commit_2). Each step lives in its own helper for readability.
+    """Consume COMMIT jobs. For each cycle: select the next model from the
+    rotation directory and sign+publish its hash (miner_commit_1), upload to
+    HF, then commit the hash+HF coords (miner_commit_2). Each step lives in its
+    own helper for readability.
     """
     if subtensor is None:
         subtensor = bittensor.Subtensor(config.chain.network)
+    # Model committed in the previous cycle, excluded from this cycle's random
+    # pick. Advances on every successful selection so the rotation keeps moving.
+    previous_model: Path | None = None
     while True:
         job = commit_queue.get()
         if job is None:  # poison pill — clean shutdown
@@ -366,7 +445,9 @@ def commit_worker(
             logger.info(f"<{PhaseNames.miner_commit_1}> shutdown signal received.")
             return
         try:
-            latest_checkpoint = _prepare_checkpoint_for_commit(config, wallet, shared_state)
+            latest_checkpoint, previous_model = _prepare_checkpoint_for_commit(
+                config, wallet, shared_state, previous_model
+            )
             _commit_signed_model_hash(config, wallet, subtensor, latest_checkpoint)
             check_phase_expired(subtensor, job.phase_response)
 
@@ -402,19 +483,26 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
     commit_queue = Queue()
     shared_state = SharedState(current_model_version, current_model_hash)
 
+    skip_download = _skip_download()
+    if skip_download:
+        logger.info("CONNITO_SKIP_DOWNLOAD=1: download worker disabled (rotation-commit mode)")
+
     # Non-daemon threads so they can be joined cleanly on shutdown.
-    download_thread = Thread(
-        target=download_worker,
-        args=(config, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
-        daemon=False,
-    )
+    download_thread = None
+    if not skip_download:
+        download_thread = Thread(
+            target=download_worker,
+            args=(config, wallet, expert_manager, download_queue, current_model_version, current_model_hash, shared_state, subtensor),
+            daemon=False,
+        )
     commit_thread = Thread(
         target=commit_worker,
         args=(config, commit_queue, wallet, shared_state, subtensor),
         daemon=False,
     )
 
-    download_thread.start()
+    if download_thread is not None:
+        download_thread.start()
     commit_thread.start()
 
     try:
@@ -423,14 +511,17 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
             config=config,
             download_queue=download_queue,
             commit_queue=commit_queue,
+            skip_download=skip_download,
         )
     finally:
         # Send poison pills so each worker loop exits cleanly.
-        download_queue.put(None)
+        if download_thread is not None:
+            download_queue.put(None)
         commit_queue.put(None)
 
         _JOIN_TIMEOUT_S = 30
-        download_thread.join(timeout=_JOIN_TIMEOUT_S)
+        if download_thread is not None:
+            download_thread.join(timeout=_JOIN_TIMEOUT_S)
         commit_thread.join(timeout=_JOIN_TIMEOUT_S)
 
         logger.info("run_system: all worker threads have exited.")
@@ -450,6 +541,12 @@ if __name__ == "__main__":
         config = MinerConfig()
 
     config.write()
+
+    # Redirect cycle-API calls to a reachable host (e.g. the local phase
+    # server) when CONNITO_OWNER_URL is set. Applied after write() so the YAML
+    # keeps the real (locked) owner_url. No-op when the env var is unset.
+    from connito.shared.cycle import apply_owner_url_override
+    apply_owner_url_override(config)
 
     wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
 
