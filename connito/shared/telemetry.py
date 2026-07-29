@@ -126,6 +126,21 @@ VALIDATOR_BASELINE_LOSS = Gauge(
     "validator_baseline_loss",
     "Round baseline loss against this validator's foreground eval set",
 )
+# Per-round baseline loss, labeled by the round it belongs to. The unlabeled
+# gauge above is overwritten every round, so a scraper can only sample it and
+# a cycle's baseline ends up timing-dependent; this labeled family lets the
+# gateway attribute the right baseline to the right round, freeze it after
+# finalize, and naturally exclude a warming-up validator that has no value for
+# a given round. Evicted on the same cutoff as the other per-round families
+# (see evict_round_series_before). The unlabeled family is retained for
+# backward compat during rollout.
+VALIDATOR_BASELINE_LOSS_BY_ROUND = Gauge(
+    "validator_baseline_loss_by_round",
+    "Round baseline loss (this validator's foreground eval set), labeled by the "
+    "round it belongs to. Stable per round; the unlabeled validator_baseline_loss "
+    "is retained for backward compat.",
+    ["round_id"],
+)
 # Numeric ID of the current round, set when `Round.freeze` returns and
 # the round becomes active. Lets aggregators key per-miner score and
 # val_loss readings to a specific round without parsing the round_id
@@ -173,6 +188,21 @@ VALIDATOR_MINER_SCORE_AVG = Gauge(
 VALIDATOR_MINER_SCORE_SAMPLES = Gauge(
     "validator_miner_score_samples",
     "Number of score samples retained for a miner within the aggregator window",
+    ["miner_uid"],
+)
+# Unix-seconds timestamp of the moment this validator last published a score
+# snapshot for the miner. Set by `set_miner_score_snapshot` alongside
+# VALIDATOR_MINER_SCORE_LATEST/_AVG/_SAMPLES, so it advances exactly once per
+# cycle at the chain-submit boundary. The gateway computes "score age" as
+# `time() - validator_miner_score_latest_emitted_at` — `timestamp(score_latest)`
+# alone is misleading because Prometheus updates the sample-timestamp on every
+# scrape (every ~5s) even when the underlying value hasn't changed, making the
+# score look freshly emitted when in fact it hasn't been updated for almost a
+# whole cycle. This gauge is the "value last changed" signal the dashboard
+# needs to render meaningful "scored Xm ago" labels.
+VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT = Gauge(
+    "validator_miner_score_latest_emitted_at",
+    "Unix seconds when this validator last published a score_latest snapshot for the miner",
     ["miner_uid"],
 )
 # Last-known per-miner eval outcome on THIS validator. Integer-coded so the
@@ -228,6 +258,39 @@ VALIDATOR_MINER_LAST_OBSERVED_COMMIT_BLOCK = Gauge(
     ["miner_uid"],
 )
 
+# --- Cycle-consistent per-miner attribution (dashboard contract) -----------
+# The gateway attributes every per-miner sample to the exact evaluation
+# round via these three families. All are set from `finalize_round_scores`
+# (including its journal-recovery replay path) so a validator restart
+# re-publishes them without waiting for a fresh round.
+VALIDATOR_MINER_LAST_SCORED_ROUND_ID = Gauge(
+    "validator_miner_last_scored_round_id",
+    "round_id of the last round in which this validator wrote a finalize "
+    "verdict (scored, tie-zeroed, validation-failed, or freeze-zero) for the miner",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_ROUND_DELTA = Gauge(
+    "validator_miner_round_delta",
+    "Raw per-round improvement signal ((baseline - val_loss) ** 1.2, >= 0) "
+    "from the miner's most recent evaluated round. Distinct from "
+    "validator_miner_score_latest, which is the finalized podium rank score.",
+    ["miner_uid"],
+)
+VALIDATOR_MINER_EVALUATED_COMMIT_INFO = Gauge(
+    "validator_miner_evaluated_commit_info",
+    "round_id in which the labeled (hf_repo_id, hf_revision) was frozen and "
+    "evaluated for the miner. At most one labelset per miner_uid (old "
+    "labelsets are evicted on change).",
+    ["miner_uid", "hf_repo_id", "hf_revision"],
+)
+# uid -> (hf_repo_id, hf_revision) currently exposed on
+# VALIDATOR_MINER_EVALUATED_COMMIT_INFO. Guarded by _COMMIT_INFO_LOCK; used
+# to evict the previous labelset when a miner's commit changes, keeping the
+# "<= 1 labelset per uid" invariant. After a restart both this dict and the
+# registry start empty, so correctness holds without persistence.
+_COMMIT_INFO_LOCK = threading.Lock()
+_COMMIT_INFO_LABELS: dict[str, tuple[str, str]] = {}
+
 # Per-round lifecycle (background submission validation)
 VALIDATOR_ROUND_LIFECYCLE_STEP = Gauge(
     "validator_round_lifecycle_step",
@@ -249,6 +312,13 @@ VALIDATOR_ROUND_MINERS_FAILED = Gauge(
     "Roster miners that failed download/eval for the round",
     ["round_id"],
 )
+# round_id label values ever emitted on the per-round families above (and on
+# VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL). Call sites register via
+# `note_round_series`; `evict_round_series_before` removes stale labelsets on
+# the same cutoff run.py already uses to prune journals/aggregator entries —
+# without this, every round leaves four-plus permanent series behind.
+_ROUND_SERIES_LOCK = threading.Lock()
+_EMITTED_ROUND_IDS: set[int] = set()
 VALIDATOR_BG_WORKER_PAUSED = Gauge(
     "validator_bg_worker_paused",
     "1 while a background worker is paused on merge_phase_active / eval_window / download_window",
@@ -331,6 +401,7 @@ EvalFailureReason = Literal[
     "non_finite_loss",
     "download_failed",
     "statedict_parse_failed",
+    "repo_unavailable",
 ]
 _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "timeout", "corrupt", "oom", "checksum", "rpc", "unknown",
@@ -338,6 +409,7 @@ _EVAL_FAILURE_REASONS: frozenset[str] = frozenset({
     "no_chain_commit", "signature_invalid", "hash_mismatch",
     "expert_group_or_nan", "non_finite_loss",
     "download_failed", "statedict_parse_failed",
+    "repo_unavailable",
 })
 
 # Stable integer codes surfaced by VALIDATOR_MINER_EVAL_STATUS. Treat as a
@@ -357,6 +429,7 @@ EVAL_STATUS_CODES: dict[int, str] = {
     9: "timeout",
     10: "deadline_exceeded",
     11: "rpc_error",
+    12: "repo_unavailable",
     99: "unknown",
 }
 _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
@@ -371,6 +444,7 @@ _EVAL_REASON_TO_STATUS_CODE: dict[str, int] = {
     "timeout": 9,
     "deadline": 10,
     "rpc": 11,
+    "repo_unavailable": 12,
     # Legacy aliases — fold into the closest miner-facing code so old
     # call sites continue producing meaningful status values.
     "corrupt": 2,
@@ -406,6 +480,135 @@ def set_miner_eval_status(miner_uid: int | str, reason: EvalFailureReason | str 
         pass
 
 
+def set_miner_last_scored_round(miner_uid: int | str, round_id: int) -> None:
+    """Record the round_id of the last finalize verdict for this miner.
+
+    Best-effort — never raises. Telemetry must not influence scoring.
+    """
+    try:
+        VALIDATOR_MINER_LAST_SCORED_ROUND_ID.labels(miner_uid=str(miner_uid)).set(
+            float(int(round_id))
+        )
+    except Exception:
+        pass
+
+
+def set_miner_round_delta(miner_uid: int | str, delta: float) -> None:
+    """Record the raw per-round improvement signal for an evaluated miner.
+
+    Best-effort — never raises.
+    """
+    try:
+        VALIDATOR_MINER_ROUND_DELTA.labels(miner_uid=str(miner_uid)).set(float(delta))
+    except Exception:
+        pass
+
+
+def set_miner_evaluated_commit(
+    miner_uid: int | str, hf_repo_id: str, hf_revision: str, round_id: int
+) -> None:
+    """Expose which (hf_repo_id, hf_revision) was frozen + evaluated for the
+    miner, valued with the round_id it belongs to.
+
+    Enforces at most ONE labelset per miner_uid: when the commit changes, the
+    previous labelset is removed from the registry before the new one is set,
+    so the gateway never sees two competing commit rows for a uid. The
+    KeyError guard covers the post-restart case (tracking dict repopulated
+    while the registry series was already re-created) and double-eviction.
+
+    Best-effort — never raises.
+    """
+    try:
+        uid = str(miner_uid)
+        repo = str(hf_repo_id or "")
+        rev = str(hf_revision or "")
+        if not repo or not rev:
+            return
+        with _COMMIT_INFO_LOCK:
+            prev = _COMMIT_INFO_LABELS.get(uid)
+            if prev is not None and prev != (repo, rev):
+                try:
+                    VALIDATOR_MINER_EVALUATED_COMMIT_INFO.remove(uid, prev[0], prev[1])
+                except KeyError:
+                    pass
+            VALIDATOR_MINER_EVALUATED_COMMIT_INFO.labels(
+                miner_uid=uid, hf_repo_id=repo, hf_revision=rev
+            ).set(float(int(round_id)))
+            _COMMIT_INFO_LABELS[uid] = (repo, rev)
+    except Exception:
+        pass
+
+
+def note_round_series(round_id: int) -> None:
+    """Register a round_id whose label value was emitted on a per-round
+    family, so `evict_round_series_before` can remove it later.
+
+    Best-effort — never raises.
+    """
+    try:
+        with _ROUND_SERIES_LOCK:
+            _EMITTED_ROUND_IDS.add(int(round_id))
+    except Exception:
+        pass
+
+
+def set_baseline_loss(round_id: int, baseline_loss: float) -> None:
+    """Publish a round's foreground-eval baseline loss to BOTH the unlabeled
+    gauge (backward compat) and the per-round labeled family.
+
+    Registers the round_id for eviction so the labeled series is pruned on
+    the same cutoff as the other per-round families. Round creation already
+    registers the id via note_round_series; the extra registration here is
+    idempotent (a set) and keeps this helper self-contained.
+
+    Best-effort — telemetry must never block scoring.
+    """
+    try:
+        value = float(baseline_loss)
+        VALIDATOR_BASELINE_LOSS.set(value)
+        note_round_series(int(round_id))
+        VALIDATOR_BASELINE_LOSS_BY_ROUND.labels(round_id=str(int(round_id))).set(value)
+    except Exception:
+        pass
+
+
+def evict_round_series_before(min_round_id: int) -> int:
+    """Remove per-round labelsets for every tracked round_id below the
+    cutoff. Called from run.py's journal/aggregator prune block with the
+    same cutoff, so metric retention matches on-disk retention.
+
+    Only rounds emitted by THIS process are tracked (the set is in-memory);
+    series left over from a previous process incarnation don't exist in the
+    fresh registry either, so nothing is leaked across restarts.
+
+    Returns the number of round_ids evicted. Best-effort — never raises.
+    """
+    removed = 0
+    try:
+        cutoff = int(min_round_id)
+        with _ROUND_SERIES_LOCK:
+            stale = [r for r in _EMITTED_ROUND_IDS if r < cutoff]
+            for r in stale:
+                rid = str(r)
+                for family in (
+                    VALIDATOR_ROUND_LIFECYCLE_STEP,
+                    VALIDATOR_ROUND_MINERS_PENDING,
+                    VALIDATOR_ROUND_MINERS_SCORED,
+                    VALIDATOR_ROUND_MINERS_FAILED,
+                    VALIDATOR_BG_EVAL_LOCK_LEAK_TOTAL,
+                    VALIDATOR_BASELINE_LOSS_BY_ROUND,
+                ):
+                    try:
+                        family.remove(rid)
+                    except KeyError:
+                        pass
+                _EMITTED_ROUND_IDS.discard(r)
+                removed += 1
+    except Exception:
+        return removed
+    return removed
+
+
 def set_miner_score_snapshot(
     miner_uid: int | str,
     *,
@@ -416,10 +619,19 @@ def set_miner_score_snapshot(
     """Publish the aggregator's per-miner snapshot (latest / avg / sample
     count) to Prometheus. Each arg is independent — pass ``None`` to skip
     that gauge for this uid. Best-effort.
+
+    Also stamps ``VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT`` with the current
+    wall-clock time whenever ``latest`` is published, so the gateway can
+    derive a meaningful "score age" from the value's last-change time
+    rather than Prometheus's scrape time (which advances every ~5s even
+    when the gauge value hasn't changed).
     """
     try:
+        now_ts: float | None = None
         if latest is not None:
+            now_ts = time.time()
             VALIDATOR_MINER_SCORE_LATEST.labels(miner_uid=str(miner_uid)).set(float(latest))
+            VALIDATOR_MINER_SCORE_LATEST_EMITTED_AT.labels(miner_uid=str(miner_uid)).set(now_ts)
         if avg is not None:
             VALIDATOR_MINER_SCORE_AVG.labels(miner_uid=str(miner_uid)).set(float(avg))
         if samples is not None:
@@ -431,7 +643,10 @@ def set_miner_score_snapshot(
 # CONTRACT: COHORT_GROUP_CODES and ASSIGNMENT_ROLE_CODES are mirrored by the
 # telemetry gateway (same pattern as EVAL_STATUS_CODES). Changing a code
 # retroactively reinterprets old Prometheus samples — extend, do not renumber.
-COHORT_GROUP_CODES: dict[int, str] = {0: "none", 1: "A", 2: "B", 3: "C"}
+# Code 4 ("tail") = miners on this validator's foreground/background roster but
+# outside the formal A/B/C tiers (the staleness pool). Distinct from 0 ("none"),
+# which means the validator has no roster status for this miner this round.
+COHORT_GROUP_CODES: dict[int, str] = {0: "none", 1: "A", 2: "B", 3: "C", 4: "tail"}
 ASSIGNMENT_ROLE_CODES: dict[int, str] = {0: "unassigned", 1: "foreground", 2: "background"}
 
 

@@ -22,10 +22,10 @@ from connito.shared.helper import (
 )
 from connito.shared.telemetry import (
     EvalFailureReason,
-    VALIDATOR_BASELINE_LOSS,
     VALIDATOR_MINER_VAL_LOSS,
     inc_error,
     inc_eval_failure,
+    set_baseline_loss,
     set_miner_eval_status,
     track_eval_latency,
     track_model_load_latency,
@@ -182,7 +182,9 @@ def finalize_round_scores(
         scored miner's: score 0 — a tied val_loss is evidence of a
         duplicated submission, so both sides are penalized regardless
         of where they would have ranked.
-      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf): score 0.
+      - `validation_failed_uids` (hash/sig/expert_group/NaN-Inf, or a
+        committed HF checkpoint confirmed not publicly retrievable):
+        score 0.
       - `freeze_zero_uids` (no/invalid chain commit at freeze): score 0.
 
     Operational failures (download timeout, eval timeout, OOM, unexpected
@@ -342,6 +344,9 @@ def finalize_round_scores(
                     validation_failed_uids=tuple(sorted(validation_failed)),
                     freeze_zero_uids=tuple(sorted(freeze_zero)),
                     freeze_zero_hotkeys=dict(freeze_hotkeys),
+                    uid_to_commit=_rj.commit_map_from_checkpoints(
+                        getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
+                    ),
                     finalized=True,
                 ),
             )
@@ -350,6 +355,54 @@ def finalize_round_scores(
                 "finalize_round_scores: journal flip-to-finalized failed",
                 round_id=round_obj.round_id, error=str(e),
             )
+
+    # --- Cycle-consistent per-miner telemetry (dashboard contract). -------
+    # Emitted HERE — not from run.py's weight loop — for two reasons:
+    # (1) the weight loop only iterates weight recipients, so the dashboard
+    #     previously saw score snapshots for ~1 uid; every verdict uid gets
+    #     one now; (2) the journal-recovery replay calls this function too,
+    #     so a restart re-publishes the series without waiting for a fresh
+    #     round. Best-effort throughout — telemetry must never block
+    #     finalize or scoring.
+    try:
+        from connito.shared.telemetry import (
+            set_miner_evaluated_commit,
+            set_miner_last_scored_round,
+            set_miner_round_delta,
+            set_miner_score_snapshot,
+        )
+
+        _rid = int(round_obj.round_id)
+        try:
+            _latest_scores = score_aggregator.uid_score_pairs(how="latest")
+            _avg_scores = score_aggregator.uid_score_pairs(how="avg")
+        except Exception:
+            _latest_scores, _avg_scores = {}, {}
+        for uid in written:
+            set_miner_last_scored_round(int(uid), _rid)
+            try:
+                _samples = score_aggregator.record_count(int(uid))
+            except Exception:
+                _samples = None
+            set_miner_score_snapshot(
+                int(uid),
+                latest=_latest_scores.get(int(uid)),
+                avg=_avg_scores.get(int(uid)),
+                samples=_samples,
+            )
+        for uid in scored:
+            set_miner_round_delta(int(uid), float(round_scores.get(uid, 0.0)))
+        _ckpt_map = getattr(round_obj, "uid_to_chain_checkpoint", None) or {}
+        for uid, _ckpt in _ckpt_map.items():
+            _repo = getattr(_ckpt, "hf_repo_id", None)
+            _rev = getattr(_ckpt, "hf_revision", None)
+            if _repo and _rev:
+                set_miner_evaluated_commit(int(uid), str(_repo), str(_rev), _rid)
+    except Exception as e:
+        logger.warning(
+            "finalize_round_scores: telemetry emission failed",
+            round_id=round_obj.round_id, error=str(e),
+        )
 
     logger.info(
         "finalize_round_scores: round scored by rank",
@@ -408,10 +461,11 @@ def build_submission_uid_weights(
     Cohort emission rule (when all four are present):
       * Group 1 (`cfg.weight_group_1_share`): top-`weight_group_1_size`
         of A∪B by aggregator avg, restricted to UIDs with
-        `record_count >= 2` AND scores recorded in at least 2 distinct
-        round_ids within the last `5 * cycle_length` blocks. The window
-        is intentionally loose so a UID that was in A∪B for only some of
-        the recent rounds still qualifies. Empty-G1 guard: if no UID
+        `record_count >= 3` AND scores recorded in at least 3 distinct
+        round_ids within the last `5 * cycle_length` blocks — i.e.
+        scored in at least 3 of the last 5 cycles. Tightens the prior
+        2-of-5 gate so a miner needs sustained participation to anchor
+        the validator's top-N ballot. Empty-G1 guard: if no UID
         clears, redirect to `uid = 0` (subnet owner) so the validator
         stays at full emission.
       * Group 2 (`cfg.weight_group_2_share`): top-`weight_group_2_size`
@@ -440,10 +494,10 @@ def build_submission_uid_weights(
 
     ab_qualified = [
         u for u in ab_uids
-        if score_aggregator.record_count(u) >= 2
+        if score_aggregator.record_count(u) >= 3
         and score_aggregator.count_distinct_round_ids_in_range(
             u, g1_window_min_rid, cur_rid,
-        ) >= 2
+        ) >= 3
     ]
     g1 = _rg.select_top_n_by_local_score(
         ab_qualified,
@@ -974,10 +1028,11 @@ async def evaluate_foreground_round(
     # `delta_loss = max(0, baseline - val_loss)` per miner. Best-effort
     # — Prometheus exposition is purely an observability side-effect
     # and must never block scoring.
-    try:
-        VALIDATOR_BASELINE_LOSS.set(float(baseline_loss))
-    except Exception:
-        pass
+    # Publishes both the unlabeled gauge (backward compat) and the per-round
+    # labeled family so the gateway can attribute this baseline to the exact
+    # round; the labeled series is evicted on the same cutoff as the other
+    # per-round families. Best-effort — never blocks scoring.
+    set_baseline_loss(round_obj.round_id, baseline_loss)
 
     foreground_set = set(round_obj.foreground_uids)
     completed: list[MinerEvalJob] = completed_out if completed_out is not None else []

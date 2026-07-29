@@ -45,6 +45,90 @@ def _fractional_index_filter(_example, idx: int, seed: str | int, threshold: int
     return score <= threshold
 
 
+def _min_text_chars_filter(example: dict[str, Any], min_chars: int) -> bool:
+    """Drop rows whose text is empty or trivially short.
+
+    Eval-path only. Empirically (Multi_Legal_Pile all_all, 2026-07-21)
+    38% of streamed rows carry a completely empty `text`; those rows
+    tokenize to all-padding sequences whose labels are fully masked, so
+    they produce NaN eval loss and silently drop out of the scored-batch
+    divisor — shrinking an already tiny eval sample. The distribution is
+    bimodal (0 chars or ≥200), so a low threshold removes exactly the
+    degenerate rows without biasing content selection.
+    """
+    return len(str(example.get("text", "")).strip()) >= min_chars
+
+
+class _PrefixDedupFilter:
+    """Keep only the first row for each distinct text prefix.
+
+    Eval-path only, and only sound single-worker: the `seen` set lives in
+    this instance, so the eval dataloader must iterate the stream in one
+    process (the eval loader runs `num_workers<=1`; see `get_dataloader`).
+
+    Rationale: templated corpora repeat their opening boilerplate across
+    documents — measured 75% of non-empty Multi_Legal_Pile rows sharing an
+    identical 200-char prefix. Scoring many near-identical rows lets a
+    miner fine-tuned on the template reach near-zero loss on "unseen"
+    documents. Deduplicating by prefix keeps one representative per
+    template instead of a batch full of copies. Deterministic given a
+    deterministic input stream (same seed → same order → same survivors).
+    """
+
+    def __init__(self, prefix_chars: int):
+        self.prefix_chars = int(prefix_chars)
+        # Exact prefixes, not `hash()` digests: builtin str hashing is
+        # per-process randomized, so two validators could disagree on a
+        # collision. The eval stream retains only ~thousands of rows, so
+        # exact storage is a few hundred KB at worst.
+        self.seen: set[str] = set()
+
+    def __call__(self, example: dict[str, Any]) -> bool:
+        prefix = str(example.get("text", ""))[: self.prefix_chars]
+        if prefix in self.seen:
+            return False
+        self.seen.add(prefix)
+        return True
+
+
+def tokenize_windowed(
+    text: str, tokenizer: PreTrainedTokenizerBase, sequence_length: int
+) -> dict[str, list]:
+    """Tokenize `text`, sampling a deterministic window from long documents.
+
+    The previous behavior (`truncation=True`) always scored/trained on a
+    document's FIRST `sequence_length` tokens. For templated corpora
+    (legal filings, papers) the prefix is the most boilerplate-heavy,
+    most predictable region of the document — document bodies never
+    entered the pipeline at all. This helper instead:
+
+    - short documents (≤ sequence_length tokens): pad to length, as before;
+    - long documents: take a `sequence_length` window whose start is
+      derived from the text's own content hash — deterministic for every
+      validator (consensus-safe: no RNG, no config), uniform-ish across
+      the document, and not influenceable by the validator.
+
+    The raw text is capped at `sequence_length * 40` chars before
+    tokenizing to bound tokenizer cost on pathological documents (real
+    corpora run 3–8 chars/token, so the cap only bites degenerate input).
+    """
+    capped = str(text)[: sequence_length * 40]
+    ids = tokenizer(capped, truncation=False, add_special_tokens=True)["input_ids"]
+    if len(ids) > sequence_length:
+        span = len(ids) - sequence_length
+        start = h256_int("token_window", capped) % (span + 1)
+        window = ids[start : start + sequence_length]
+        return {"input_ids": window, "attention_mask": [1] * sequence_length}
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    n = len(ids)
+    return {
+        "input_ids": ids + [pad_id] * (sequence_length - n),
+        "attention_mask": [1] * n + [0] * (sequence_length - n),
+    }
+
+
 # -----------------------------
 # Dataset
 # -----------------------------
@@ -86,7 +170,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         example: dict[str, str], tokenizer: PreTrainedTokenizerBase, sequence_length: int
     ) -> dict[str, list]:
         text = example.get("text", "")
-        return tokenizer(text, truncation=True, max_length=sequence_length, padding="max_length")  # type: ignore
+        return tokenize_windowed(text, tokenizer, sequence_length)
 
     @classmethod
     def get_tokenised_dataset(
@@ -101,12 +185,23 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
     ):
         split_name = "train" if train else "validation"
 
-        def _load_streaming_split(ds_name: str, ds_config: str | None = None):
+        def _load_streaming_split(
+            ds_name: str,
+            ds_config: str | None = None,
+            trust_remote_code: bool = False,
+        ):
             """Helper to load a dataset split safely, falling back to 'train' if 'validation' is missing."""
             try:
-                load_kwargs = {"streaming": True, "revision": "main"}
+                load_kwargs: dict[str, Any] = {"streaming": True, "revision": "main"}
                 if ds_config is not None:
                     load_kwargs["name"] = ds_config
+                if trust_remote_code:
+                    # Authorize HF to execute the dataset repo's custom
+                    # builder script. Opt-in per source via
+                    # DatasetSourceCfg.trust_remote_code; never on by
+                    # default. See config.DatasetSourceCfg for the
+                    # rationale.
+                    load_kwargs["trust_remote_code"] = True
 
                 ds = load_dataset(ds_name, **load_kwargs)
                 if split_name in ds:
@@ -185,6 +280,37 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         def ensure_string(example: dict[str, Any], source_text_column: str):
             return {"text": str(example[source_text_column])}
 
+        # Convert string seed to integer. Reused as the
+        # shard-pick / in-shard offset hash input AND as the
+        # `interleave_datasets(seed=...)` argument, so the value must
+        # be available before the per-source load loop.
+        int_seed = int(str(seed)[:8], 16) if seed else 42
+
+        # Switch to seeded shard-pick when the operator has flipped the
+        # gate AND the caller passed a seed (i.e. validator eval, not
+        # miner training). See `connito/shared/eval_shard_pick.py` for
+        # the consensus assumptions; in particular, every configured
+        # source must have a registered policy and (ideally) a pinned
+        # revision SHA in `eval_source_revision_pin`.
+        seeded_pick_enabled = (
+            seed is not None
+            and bool(getattr(config.task.exp.data, "eval_source_seeded_shard_pick", False))
+        )
+        revision_pin_map = (
+            getattr(config.task.exp.data, "eval_source_revision_pin", None) or {}
+        )
+        if seeded_pick_enabled:
+            # Lazy import — avoids pulling the HF API stack into the
+            # legacy code path.
+            from connito.shared.eval_shard_pick import (
+                load_streaming_shard,
+                pick_shard_for_source,
+            )
+            logger.info(
+                "eval dataloader using seeded shard-pick path",
+                seed=seed, int_seed=int_seed,
+            )
+
         dataset_splits = []
         dataset_weights = []
 
@@ -193,6 +319,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             ds_config = _source_value(source, "name")
             text_column = _source_value(source, "text_column", "text")
             weight = float(_source_value(source, "weight", 1.0))
+            trust_remote_code = bool(_source_value(source, "trust_remote_code", False))
 
             if not ds_name:
                 raise ValueError("Each dataset source must define a non-empty 'path'.")
@@ -201,21 +328,61 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             if weight <= 0:
                 raise ValueError(f"Dataset source {ds_name!r} must have a positive 'weight'.")
 
-            source_split = _load_streaming_split(ds_name, ds_config=ds_config)
+            pick = None
+            if seeded_pick_enabled:
+                pick = pick_shard_for_source(
+                    repo_id=ds_name,
+                    name=ds_config,
+                    int_seed=int_seed,
+                    revision_override=revision_pin_map.get(ds_name),
+                )
+                logger.info(
+                    "shard pick",
+                    repo_id=ds_name, name=ds_config,
+                    shard=pick.shard_path, revision=pick.revision,
+                    shard_rows=pick.shard_rows, offset=pick.in_shard_offset,
+                )
+                source_split = load_streaming_shard(pick, split_name=split_name)
+            else:
+                source_split = _load_streaming_split(
+                    ds_name,
+                    ds_config=ds_config,
+                    trust_remote_code=trust_remote_code,
+                )
+
             source_split = source_split.select_columns([text_column])
             source_split = source_split.map(
                 partial(ensure_string, source_text_column=text_column),
                 features=common_features,
             )
 
+            # Eval-path data-quality gate (seed is None on the miner
+            # training path, which stays byte-identical). Applied
+            # per-source and before interleave so the source weights
+            # keep describing *usable* rows — an unfiltered source with
+            # 38% empty rows would otherwise contribute 38% NaN batches
+            # at its configured weight.
+            eval_min_text_chars = int(
+                getattr(config.task.exp.data, "eval_min_text_chars", 0) or 0
+            )
+            if seed is not None and eval_min_text_chars > 0:
+                source_split = source_split.filter(
+                    partial(_min_text_chars_filter, min_chars=eval_min_text_chars)
+                )
+
+            if pick is not None:
+                # In-shard offset goes here so the validator's read
+                # window lands at a random depth inside the chosen
+                # shard rather than at row 0. Bounded by the chosen
+                # shard's own row count — no min-across-sources to
+                # maintain, no over-skip risk past end-of-stream.
+                source_split = source_split.skip(pick.in_shard_offset)
+
             dataset_splits.append(source_split)
             dataset_weights.append(weight)
 
         if not dataset_splits:
             raise ValueError("No dataset sources were configured.")
-
-        # Convert string seed to integer for interleave_datasets if provided
-        int_seed = int(str(seed)[:8], 16) if seed else 42
 
         # Streaming-shuffle each source BEFORE interleave when the caller
         # passed a seed (validator eval path; miners pass seed=None so this
@@ -240,7 +407,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         shuffle_buffer = int(
             getattr(config.task.exp.data, "eval_source_shuffle_buffer", 0) or 0
         )
-        if seed is not None and shuffle_buffer > 0:
+        if seed is not None and not seeded_pick_enabled and shuffle_buffer > 0:
             logger.debug(
                 "Shuffling each source before interleave",
                 seed=seed, int_seed=int_seed, buffer_size=shuffle_buffer,
@@ -263,7 +430,7 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
         skip_max = int(
             getattr(config.task.exp.data, "eval_source_skip_max", 0) or 0
         )
-        if seed is not None and skip_max > 0:
+        if seed is not None and not seeded_pick_enabled and skip_max > 0:
             skip_rng = random.Random(int_seed)
             offsets = [skip_rng.randrange(0, skip_max) for _ in dataset_splits]
             logger.debug(
@@ -281,6 +448,18 @@ class DefaultStreamingTorchDataset(TorchIterableDataset):
             probabilities = [weight / total_weight for weight in dataset_weights]
             logger.debug("Interleaving dataset sources", probabilities=probabilities)
             split = interleave_datasets(dataset_splits, probabilities=probabilities, seed=int_seed)
+
+        # Eval-path template dedup: drop rows repeating an already-seen
+        # text prefix (templated corpora open millions of documents with
+        # the same boilerplate — see `_PrefixDedupFilter`). Runs after
+        # interleave so the dedup window spans the whole eval stream, and
+        # before the fractional filter so surviving indices stay
+        # deterministic for every validator.
+        eval_dedup_prefix_chars = int(
+            getattr(config.task.exp.data, "eval_dedup_prefix_chars", 0) or 0
+        )
+        if seed is not None and eval_dedup_prefix_chars > 0:
+            split = split.filter(_PrefixDedupFilter(eval_dedup_prefix_chars))
 
         # Optional deterministic subsampling based on (seed, fraction)
         # Applied *before* sharding on the streaming iterable.

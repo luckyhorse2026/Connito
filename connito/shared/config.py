@@ -203,6 +203,14 @@ class DatasetSourceCfg(BaseConfig):
     name: str | None = None
     weight: PositiveFloat = 1.0
     text_column: str = "text"
+    # Authorize HF's `load_dataset` to execute the dataset repo's custom
+    # builder script. Required for sources that ship a `<name>.py` loader
+    # (e.g. joelniklaus/Multi_Legal_Pile). Opt-in per source so a single
+    # malicious dataset can't piggyback through a globally-enabled flag —
+    # operators consent to executing remote code one dataset at a time.
+    # Pin the source's revision via `eval_source_revision_pin` when
+    # turning this on to bound the surface to a reviewed SHA.
+    trust_remote_code: bool = False
 
     @model_validator(mode="after")
     def _validate_non_empty(self):
@@ -214,12 +222,12 @@ class DatasetSourceCfg(BaseConfig):
 
 
 class DataCfg(BaseConfig):
-    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir"})
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"dataset_name", "data_dir", "sequence_length"})
     dataset_name: str = "allenai/c4"
     data_dir: str | None = 'en'
     dataset_sources: list[DatasetSourceCfg] | None = None
     batch_size: PositiveInt = 4
-    sequence_length: PositiveInt = 4096
+    sequence_length: PositiveInt = 1024
     per_device_train_batch_size: PositiveInt = 1
     world_size: int = 10
     rank: int = 1
@@ -268,6 +276,54 @@ class DataCfg(BaseConfig):
     # `eval_source_shuffle_buffer` — validators on different defaults
     # diverge for one round, then re-converge.
     eval_source_skip_max: int = 50_000
+    # Switch the validator eval path from the legacy
+    # `.shuffle(seed) + .skip(small)` window (reachable region capped
+    # at first ~`shuffle_buffer + skip_max` rows of every shard) to
+    # seeded shard-pick + hash-mod in-shard offset. When True, the
+    # reachable region per round is the WHOLE chosen shard; across
+    # rotating seeds, every shard × every row is eventually reachable.
+    # `eval_source_shuffle_buffer` and `eval_source_skip_max` are
+    # ignored on the new path.
+    #
+    # See `connito/shared/eval_shard_pick.py` for the threat model,
+    # consensus assumptions (revision pin per source, deterministic
+    # sort, per-source safe-floor + verified-spot-check policy) and
+    # the policy registry that must contain an entry for every
+    # configured source.
+    #
+    # Default ON. Same coordinated-rollout discipline as the
+    # earlier shuffle/skip bumps: flip together with all validators
+    # at a gated chain epoch, otherwise losses diverge for the
+    # transition round and weight consensus breaks.
+    eval_source_seeded_shard_pick: bool = True
+    # Per-source HF commit SHA to pin shard listing + shard reads to.
+    # Keys are the source `path` (e.g. `"allenai/c4"`), values are
+    # 40-char SHAs. When omitted for a source, the policy's default
+    # `revision` in `eval_shard_pick._KNOWN_SOURCES` is used.
+    #
+    # Required for genuine consensus safety — `"main"` is a moving
+    # target and a mid-rollout HF re-upload would cause two
+    # validators to pick different rows for the same seed.
+    eval_source_revision_pin: dict[str, str] | None = None
+    # --- Eval-stream data-quality gates (validator eval path only; the
+    # miner training stream passes seed=None and is unaffected). Both
+    # are deterministic, so all validators on the same version keep
+    # identical eval batches. Same coordinated-rollout discipline as
+    # the other eval_source_* knobs.
+    #
+    # Drop rows whose text is shorter than this many characters after
+    # strip(). Motivated by Multi_Legal_Pile all_all, where 38% of
+    # streamed rows have empty text: those tokenize to all-padding
+    # sequences whose loss is NaN, silently shrinking the scored eval
+    # sample. 0 disables.
+    eval_min_text_chars: int = 200
+    # Keep only the first row per distinct text prefix of this many
+    # characters. Templated corpora repeat opening boilerplate across
+    # documents (measured: 75% of non-empty Multi_Legal_Pile rows share
+    # an identical 200-char prefix); scoring duplicates hands
+    # template-memorizing miners near-zero loss on "unseen" rows.
+    # 0 disables.
+    eval_dedup_prefix_chars: int = 200
 
     @model_validator(mode="after")
     def _validate_dataset_sources(self):
@@ -287,7 +343,7 @@ class MoECfg(BaseConfig):
     interleave: bool = True
     num_experts: PositiveInt = 8
     num_experts_per_tok: PositiveInt = 2
-    partial_topk: PositiveInt = 1
+    partial_topk: PositiveInt = 6
     full_topk: PositiveInt = 2
     aux_load_balance: bool = True
     router_aux_loss_coef: float = 1.0
@@ -296,9 +352,16 @@ class MoECfg(BaseConfig):
 
 
 class OptimizerCfg(BaseConfig):
-    lr: float = 1e-5
+    lr: float = 1e-4
     outer_lr: float = 0.7
     outer_momentum: float = 0.9
+    # Inner AdamW optimizer-state precision (exp_avg + exp_avg_sq):
+    #   32 -> torch.optim.AdamW, fp32 state (default). Fits DeepSeek-V2-Lite
+    #         2Fnat on a 47GB A6000 at sequence_length 1024.
+    #    8 -> bitsandbytes AdamW, 8-bit blockwise-quantized state (~4x smaller);
+    #         an alternative when running fp32 at a larger sequence_length.
+    # bitsandbytes has no 16-bit AdamW state, so only 8 or 32 are valid.
+    adamw_optim_bits: int = 32
 
 
 class ParallelismCfg(BaseConfig):
@@ -323,6 +386,12 @@ class ScheduleCfg(BaseConfig):
 
 
 class CheckpointCfg(BaseConfig):
+    # Locked so every validator resumes local training state on restart —
+    # uniform behavior across the fleet. On load it is auto-reset to the
+    # default (True); an operator who needs a clean cold-start (e.g. recovering
+    # from a corrupt/incompatible checkpoint) should point at a fresh, empty
+    # checkpoint_path rather than disabling resume, which is no longer honored.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({"resume_from_ckpt"})
     resume_from_ckpt: bool = True
     strict_sharding: bool = False
     base_checkpoint_path: Path = Path("checkpoints/miner")
@@ -334,6 +403,20 @@ class CheckpointCfg(BaseConfig):
     # Legacy compatibility knob. Miner checkpoint downloads pull from HF only,
     # but older configs may still include this field.
     download_concurrency: PositiveInt = 1
+    # When True, skip the chain-fetch of the validator's latest checkpoint
+    # AND the on-disk overlay in get_model_from_checkpoint. The model returns
+    # with pretrained DeepSeek-V2-Lite weights only — useful for cold-start
+    # experiments (2Fnat paradigm smoke, LR sweeps starting from the base
+    # backbone). Overrides resume_from_ckpt.
+    use_pretrained_only: bool = False
+    # When True (default) the miner's inner-opt-step loop calls the
+    # "(5) Reload Model" branch that re-runs setup_training if it finds a
+    # newer checkpoint on disk. Under use_pretrained_only=True this reload
+    # rebuilds from pretrained every step and discards optimizer progress,
+    # so val_loss stays flat. Set to False for standalone smoke/train runs
+    # where you don't want the miner reacting to on-disk validator
+    # checkpoints. Production miners should leave this True.
+    enable_peer_resync: bool = True
 
 
 class HfCfg(BaseConfig):
@@ -417,15 +500,41 @@ class OwnerCheckpointCfg(CheckpointCfg):
 
 class ExpertCfg(BaseConfig):
     data: DataCfg = Field(default_factory=DataCfg)
-    group_id: int = 0
+    # -1 signals "not assigned to a functioning slot" — the group is defined
+    # (has an expert_assignment.json) but is not yet mapped to a stable
+    # runtime slot. Default -1 avoids silent clashes with an already-in-use
+    # slot (e.g. exp_math permanently owns 0) when the field is forgotten.
+    group_id: int = -1
 
 
 class TaskCfg(BaseConfig):
-    expert_group_name: str = "exp_math"
+    # `expert_group_name` is locked so operators can't drift back to
+    # `exp_math` after the subnet-wide switch to the legal expert group —
+    # `auto_update_config` resets any non-default value on load and logs a
+    # one-time reset warning (see docs/exp-legal-migration-plan.md for the
+    # activation checklist). `helper_group_id` and `routing_mode` stay
+    # locked for the natural-routing (2Fnat) consensus contract.
+    _LOCKED_FIELDS: ClassVar[frozenset[str]] = frozenset({
+        "expert_group_name", "helper_group_id", "routing_mode",
+    })
+    expert_group_name: str = "exp_legal"
     load_all_expert_groups: bool = False
     base_path: Path = Path("expert_groups")
     path: Path | None = None
     exp: ExpertCfg = Field(default_factory=ExpertCfg)
+    # Peer expert group loaded alongside `exp.group_id` as a frozen helper for
+    # the 2Fnat routing rule. Non-trainable natural top-k picks get replaced by
+    # the token's top-scoring helper. Defaults to 2 (exp_c4_p02, the standing
+    # frozen-helper slot). Set to None to disable the pairing — the routing
+    # branch self-gates and falls through to masked-topk.
+    helper_group_id: int | None = 2
+    # MoE routing rule for CustomDeepseekV2Moe. "natural_with_fallback" (2Fnat)
+    # is the default: base gate runs unmasked, natural picks landing in the
+    # trainable set are kept as-is, non-trainable picks get replaced by the
+    # token's top-scoring helper. Falls back to masked-topk automatically when
+    # only a single group is loaded (helper_ids empty). Set to "masked_topk"
+    # to force the pre-2Fnat behavior.
+    routing_mode: str = "natural_with_fallback"
 
 
 # ---------------------------
@@ -493,8 +602,18 @@ class WorkerConfig(BaseConfig):
         # ckpt paths — always start from the class default (relative)
         base_ckpt = root / Path(ckpt_cls.model_fields["base_checkpoint_path"].default)
         self.ckpt.base_checkpoint_path = base_ckpt
+        # Include expert_group_name in the leaf so switching the active expert
+        # group automatically writes/resumes from a fresh, group-isolated
+        # directory — no run_name bump needed, and no risk of resuming another
+        # group's (incompatible) checkpoints. Re-derived after locked-field
+        # reset via _update_by_task -> _refresh_paths, so the path always
+        # tracks the *effective* group.
         self.ckpt.checkpoint_path = (
-            base_ckpt / self.chain.coldkey_name / self.chain.hotkey_name / self.run.run_name
+            base_ckpt
+            / self.chain.coldkey_name
+            / self.chain.hotkey_name
+            / self.run.run_name
+            / self.task.expert_group_name
         )
         self.ckpt.validator_checkpoint_path = (
             base_ckpt / Path(ckpt_cls.model_fields["validator_checkpoint_path"].default)
@@ -576,7 +695,7 @@ class WorkerConfig(BaseConfig):
     # Locked-field enforcement
     # -----------------------
     # Sub-config sections that participate in locked-field checks.
-    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation")
+    _LOCKED_SECTIONS: ClassVar[tuple[str, ...]] = ("chain", "cycle", "model", "moe", "sched", "ckpt", "evaluation", "task")
 
     @classmethod
     def from_path(cls, path: str | Path, auto_update_config: bool = False) -> "WorkerConfig":
@@ -585,7 +704,25 @@ class WorkerConfig(BaseConfig):
             data = yaml.safe_load(f) or {}
         instance = cls(**data)
         instance._prompt_new_fields(yaml_data=data, config_path=path, auto_update=auto_update_config)
+        pre_lock_group = instance.task.expert_group_name
         instance.check_and_prompt_locked(config_path=path, auto_update=auto_update_config)
+        # Locked-field enforcement may have just reset task.expert_group_name
+        # (the exp_legal activation path: a YAML still saying exp_math gets
+        # reset to the locked default). task.path / task.exp were derived at
+        # construction from the PRE-reset name, so re-derive them — otherwise
+        # the process persists "exp_legal" to disk but keeps RUNNING exp_math
+        # (wrong group_id on chain commits) until a second restart. Observed
+        # live on the pioneer validator, 2026-07-11 11:49 UTC.
+        if instance.task.expert_group_name != pre_lock_group:
+            logger.info(
+                "Locked-field reset changed the active task — re-deriving task config",
+                old_task=pre_lock_group,
+                new_task=instance.task.expert_group_name,
+            )
+            # Pass the name explicitly: the no-arg form of _update_by_task
+            # reloads task.exp from the STALE task.path before refreshing
+            # paths, so the exp config would still be the old group's.
+            instance._update_by_task(expert_group_name=instance.task.expert_group_name)
         return instance
 
     def _prompt_new_fields(
@@ -871,6 +1008,14 @@ class EvalCfg(BaseConfig):
     validation_group_c_size: int = 17
     group_a_min_consensus: int = 1               # ≥ 1 qualified validator
     group_a_min_weight_per_validator: float = 0.03   # > 3% from at least one validator
+    # When a miner's committed HF repo/revision/file is definitively not
+    # retrievable (deleted, private, gated, revision rewritten) AND an
+    # unauthenticated probe confirms it is not publicly fetchable, treat
+    # the miss as the miner's fault: record score=0 for the round instead
+    # of preserving the prior rolling average. Closes the
+    # "delete-your-model-and-keep-earning" hole; set False to restore the
+    # legacy EMA-preserving behavior.
+    repo_unavailable_is_miner_fault: bool = True
 
 
 class ValidatorConfig(WorkerConfig):

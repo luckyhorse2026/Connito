@@ -187,8 +187,9 @@ from connito.shared.telemetry import (
     set_miner_assignment_role,
     set_miner_cohort_group,
     set_miner_last_observed_commit_block,
-    set_miner_score_snapshot,
     set_validator_identity,
+    note_round_series,
+    evict_round_series_before,
     track_metagraph_sync_latency,
 )
 from datetime import datetime
@@ -1092,6 +1093,22 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         "round_journal.prune_before_round failed",
                         error=str(e),
                     )
+                # Evict per-round Prometheus labelsets on the same cutoff so
+                # metric retention matches on-disk retention (without this,
+                # every round leaves permanent {round_id} series behind).
+                try:
+                    _series_evicted = evict_round_series_before(_min_round_id)
+                    if _series_evicted:
+                        logger.info(
+                            "telemetry: evicted stale per-round series",
+                            rounds=_series_evicted,
+                            min_round_id=_min_round_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "telemetry.evict_round_series_before failed",
+                        error=str(e),
+                    )
                 logger.info(
                     "(4) Handing weight submission to background submitter",
                     round_id=pending_round.round_id,
@@ -1120,26 +1137,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
                 # Mirror the about-to-submit weights into Prometheus so
                 # external aggregators don't have to scrape `/v1/state.json`
-                # to learn what each validator votes on chain. Mirrors the
-                # semantics of `score_aggregator.uid_score_pairs(how="avg")`
-                # — entries are written only for UIDs we actually weight,
-                # so a miner the validator has never scored has *no* sample
-                # rather than a zero (preserves prior EMA semantics).
+                # to learn what each validator votes on chain. Entries are
+                # written only for UIDs we actually weight, so a miner the
+                # validator has never scored has *no* sample rather than a
+                # zero (preserves prior EMA semantics).
                 #
-                # Same scrape also publishes the aggregator snapshot
-                # (latest / avg / sample count) for every UID we weight,
-                # so the gateway can render miner-facing telemetry without
-                # re-deriving from per-round samples. Best-effort throughout
-                # — a Prometheus failure must not block weight submission.
-                try:
-                    _latest_scores = score_aggregator.uid_score_pairs(how="latest")
-                    _avg_scores = score_aggregator.uid_score_pairs(how="avg")
-                except Exception as _e:
-                    logger.warning(
-                        "Failed to read aggregator snapshot for telemetry",
-                        error=str(_e),
-                    )
-                    _latest_scores, _avg_scores = {}, {}
+                # The per-miner score snapshots (latest / avg / samples /
+                # emitted_at) are NOT published here anymore — they moved to
+                # `finalize_round_scores`, which covers every verdict uid
+                # (not just weight recipients) and re-publishes via the
+                # journal-recovery replay after a restart.
                 for _uid, _weight in uid_weights.items():
                     try:
                         VALIDATOR_MINER_WEIGHT_SUBMITTED.labels(
@@ -1147,16 +1154,6 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                         ).set(float(_weight))
                     except Exception:
                         pass
-                    try:
-                        _samples = score_aggregator.record_count(int(_uid))
-                    except Exception:
-                        _samples = None
-                    set_miner_score_snapshot(
-                        int(_uid),
-                        latest=_latest_scores.get(int(_uid)),
-                        avg=_avg_scores.get(int(_uid)),
-                        samples=_samples,
-                    )
                 # Fire-and-forget. ChainSubmitter sets
                 # pending_round.weights_submitted once the chain accepts the call.
                 chain_submitter.async_submit_weight(pending_round, uid_weights)
@@ -1171,10 +1168,11 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # the round's weights on chain. If the round's submit fails, next
             # cycle's stale-weights check catches it (no race that cycle).
             max_weight_age = int(config.cycle.cycle_length)
-            # `lite=False` so `metagraph.weights` is populated for
-            # `Round.freeze`'s chain-weight prepend (segment (a)). The
-            # heavier payload is fetched once per cycle and reused for
-            # the fallback-weights check below as well as `Round.freeze`.
+            # `lite=False` so `metagraph.weights` is populated, matching the
+            # shape we re-fetch below right before `Round.freeze`. This fetch
+            # is only used for the fallback-weights staleness check that
+            # follows; the freeze-time fetch is refreshed separately because
+            # ~80 blocks of phases pass between here and Submission.
             metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
             my_uid = metagraph.hotkeys.index(wallet.hotkey.ss58_address)
             last_update = metagraph.last_update[my_uid].item()
@@ -1286,6 +1284,13 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
                     )
                     current_cohort_state = None
 
+            # Refresh metagraph immediately before freezing. The earlier
+            # fetch happened during MinerCommit1 (~80 blocks ago), so its
+            # `last_update` / `weights` view is stale by a full submission
+            # period. Re-fetching here gives `Round.freeze` the most recent
+            # chain-weight and staleness signals available.
+            metagraph = lite_subtensor.metagraph(netuid=config.chain.netuid, lite=False)
+
             # (0) Lock and prioritize: build the round roster (stalest miners
             # first within both foreground and background — see Round.freeze),
             # restricted to this validator's assignment, capture the seed, and
@@ -1339,6 +1344,16 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
 
                 _foreground_set = {int(u) for u in new_round.foreground_uids}
                 _background_set = {int(u) for u in new_round.background_uids}
+
+                # Tail = miners on this validator's roster (foreground or
+                # background) but outside the formal A/B/C tiers. Distinct
+                # from code 0 ("none"), which means the validator has no
+                # roster status for this miner at all. The dashboard uses
+                # this to render "evaluated opportunistically" instead of
+                # leaving these miners visually indistinguishable from
+                # unrostered ones.
+                for _uid in (_foreground_set | _background_set) - _group_code_by_uid.keys():
+                    _group_code_by_uid[_uid] = 4
 
                 for _uid in range(len(metagraph.hotkeys)):
                     set_miner_cohort_group(_uid, _group_code_by_uid.get(_uid, 0))
@@ -1400,6 +1415,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             round_ref.swap(new_current=new_round)
             download_window_closed.clear()
             try:
+                note_round_series(new_round.round_id)
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(0)
             except Exception:
                 pass
@@ -1479,6 +1495,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             if eval_worker is not None and not eval_worker.has_eval_base_model():
                 eval_worker.set_eval_base_model(copy.deepcopy(global_model))
             try:
+                note_round_series(new_round.round_id)
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(2)
             except Exception:
                 pass
@@ -1710,6 +1727,7 @@ def run(rank: int, world_size: int, config: ValidatorConfig, pkg_version: str = 
             # the post-Merge mutation of global_model does not affect it.
             eval_window_active.set()
             try:
+                note_round_series(new_round.round_id)
                 VALIDATOR_ROUND_LIFECYCLE_STEP.labels(round_id=str(new_round.round_id)).set(3)
             except Exception:
                 pass

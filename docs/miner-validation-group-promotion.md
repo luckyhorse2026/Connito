@@ -13,6 +13,171 @@ start of every cycle's Submission phase.
 
 ---
 
+## 0. Becoming eligible — the chain-commit gates
+
+Everything below this section assumes your miner is already in
+`validator_miner_assignment.miners_with_checkpoint`. That set is the
+output of a four-stage filter applied at the start of every cycle's
+Submission phase. If your miner doesn't land in it, no validator
+evaluates you and you cannot earn into Groups A/B/C this cycle —
+regardless of your model quality.
+
+The gates run in this order. Failing any one drops the commit
+silently (debug-level log on the validator side).
+
+### Gate A — role gating (`shared/chain.py:get_chain_commits`)
+
+For each on-chain commitment on the subnet:
+
+1. **Hotkey must be in the metagraph** at the queried block. Deregistered
+   hotkeys are skipped (`Skipping commit from hotkey not in metagraph`).
+2. **Commit JSON must parse** as a `MinerChainCommit`. Schema mismatch
+   (missing required fields, wrong types) → dropped with
+   `Failed to parse chain commit`.
+3. **Hotkey must be classified as a miner, not a validator.** Role
+   gating uses two signals from the previous phase:
+   - `is_whitelisted = hotkey in whitelisted_validators` (from
+     `get_validator_whitelist_from_api`), AND
+   - `is_weight_fresh = (current_block − neuron.last_update) ≤ cycle_length`.
+
+   A hotkey is treated as a validator only if **both** are true.
+   Whitelisted but stale, or fresh but not whitelisted → miner. Plain
+   miners pass through with neither signal set.
+
+### Gate B — checkpoint completeness (`shared/checkpoints.py:filter_checkpoints`, `for_role="miner"`)
+
+After role gating, the validator joins your **signed-hash commit** and
+your **hash commit** into a single `ChainCheckpoint` and runs the
+completeness filter:
+
+4. **Every required field must be present** on the joined checkpoint:
+   `signed_model_hash`, `model_hash`, `global_ver`, `expert_group`,
+   `uid`, `ip`, `port`, `hotkey`. Any missing field → excluded with
+   `filter_checkpoints: excluded (incomplete)`.
+5. The **`global_ver` version-range gate is skipped for miners.**
+   `filter_checkpoints` logs `skipping version range gate (miner role)`
+   and passes the commit through regardless of how far `global_ver`
+   sits from the current cycle's window. The gate still applies when
+   `for_role == "validator"` (cross-validator agreement on the
+   majority hash), but a miner's commit will never be dropped here for
+   a version reason. (Rationale: chain-commit blocks can race the
+   `min_allowed_version` / `max_allowed_version` window by 1–2 blocks,
+   silently dropping fresh, otherwise-valid miner submissions; see
+   commit `f53c49b`.)
+6. Miners are **not** subject to the majority-hash filter that gates
+   validators — that step is skipped when `for_role == "miner"`. Your
+   `model_hash` can differ from the consensus and you still pass.
+
+### Gate C — join requirement (`shared/checkpoints.py:build_chain_checkpoints_from_previous_phase`)
+
+The completeness check runs against a `ChainCheckpoint` that is
+already the join of two on-chain commits per hotkey, each pulled at
+its own block:
+
+7. You must have **both** commitments posted, indexed by hotkey:
+   - A **signed-hash commit** carrying `signed_model_hash` (the small
+     signature payload).
+   - A **hash commit** carrying `model_hash`, `global_ver`,
+     `expert_group`, `inner_opt`, `hf_repo_id`, `hf_revision`.
+
+   A hotkey that posted only one of the two has its other half come
+   back as `None`, fails Gate B (missing `signed_model_hash` or
+   `model_hash`), and is excluded as incomplete.
+
+**At which block each commit is pulled.** `build_chain_checkpoints_from_previous_phase`
+calls `get_blocks_from_previous_phase_from_api(config)` — a request to
+the cycle API at `https://cycle-api.connito.ai:443/previous_phase_blocks` —
+to retrieve the exact `[start, end]` block range for every phase of
+the **previous** cycle. It then issues two archive reads:
+
+- **Signed-hash commit** (for `for_role="miner"`): read at
+  `commit_1_end_block = previous_phase_range[MinerCommit1][1] + 1`
+  — i.e. one block **after** the end of the previous cycle's
+  `MinerCommit1` window. Any signed-hash commit posted strictly
+  inside that window is in scope; commits posted later (or earlier
+  than the prior `MinerCommit1`) are invisible to this read.
+- **Hash commit** (for `for_role="miner"`): read at
+  `commit_2_end_block = previous_phase_range[MinerCommit2][1] + 1`
+  — one block after the previous cycle's `MinerCommit2` window. Same
+  rule: commits must land inside `MinerCommit2` to be picked up.
+
+Both reads use the archive subtensor (`config.chain.network`); the
+function refuses to use the lite endpoint because historical
+`block=N` queries don't resolve on pruned nodes.
+
+**Phase-overlap guard.** If `get_phase_from_api` reports the
+validator is currently *inside* `MinerCommit1` or `MinerCommit2`
+when this function is called, it `wait_till(config, Submission)`
+before reading — so commits posted while a window is still open
+never race the validator's read. The reads happen against blocks
+that are already committed history by the time the call lands.
+
+**Operator takeaway.** Your commits must be on-chain **before the
+last block of the corresponding commit phase ends**. The validator
+reads at `phase_end + 1`, so the latest you can post is the same
+block the phase closes. Posting one block late means your commit
+won't be considered until the *following* cycle — by which time
+your `global_ver` may be outside the version-range window (Gate B
+step 5) and dropped anyway.
+
+### Gate D — assignment cap (`shared/cycle.py:get_validator_miner_assignment`)
+
+The miner set that survives A–C is passed to assignment. Two more
+filters apply:
+
+8. **Hotkey must appear in both** the miner set (from `get_miners_from_commit`)
+   AND the post-filter `chain_checkpoints_by_hotkey`. The intersection
+   is logged on miss as `excluding miners without chain checkpoint`.
+9. **Incentive-rank cap.** The surviving miners are sorted by
+   `metagraph.incentive` desc (tiebreaker: hotkey asc for determinism
+   across validators), then truncated to
+   `cap = config.evaluation.foreground_top_n × num_validators`.
+   Miners beyond the cap are dropped from foreground assignment with
+   `dropped low-incentive miners beyond capacity`, but **are kept in
+   `all_miners_with_checkpoint`** — the bg-download/eval workers still
+   pull them for subnet-wide coverage. Only the foreground assignment
+   (the set the validator commits chain weights against this cycle)
+   respects the cap.
+
+### Cheat-sheet checklist for miner operators
+
+To make your chain commit count toward `validator_miner_assignment` this
+cycle:
+
+- [ ] Hotkey is registered on the subnet at the freeze block.
+- [ ] You posted **two** commits this commit phase: a signed-hash commit
+      AND a hash commit (one without the other = silent drop).
+- [ ] The hash commit JSON contains every field: `model_hash`,
+      `global_ver`, `expert_group`, `inner_opt`, `hf_repo_id`,
+      `hf_revision`. Schema must parse as `MinerChainCommit`.
+- [ ] Axon `ip` and `port` are reachable (served via `Axon.serve` at
+      startup — without this the joined checkpoint is missing `ip`/`port`
+      and fails Gate B).
+- [ ] You are **not** misclassified as a validator: either don't appear
+      on the validator whitelist (the typical case for miners), or
+      ensure your `last_update` is stale enough that role gating
+      classifies you as a miner.
+- [ ] Your `metagraph.incentive` puts you in the top
+      `foreground_top_n × num_validators` slice (default `5 × N`).
+      Below this rank, only background eval picks you up — you do not
+      contribute to A/B/C rewards this cycle. This is the only gate
+      that scales with subnet activity rather than your own actions.
+
+Common failure modes seen in production validator logs:
+
+- `excluding miners without chain checkpoint` → either you only posted
+  the signed-hash commit (no hash commit yet), or the hash commit
+  arrived after the previous phase's deadline window closed.
+- `Failed to parse chain commit` → your JSON shape doesn't match
+  `MinerChainCommit`. Inspect the schema in
+  `connito/shared/chain.py` and the model in
+  `connito/shared/checkpoints.py`.
+- No log line at all for your hotkey → role gating treated you as a
+  validator. Check whether your hotkey is on the cycle API's validator
+  whitelist.
+
+---
+
 ## The three validation groups
 
 | Group | Role | Size | Where it comes from |
@@ -135,14 +300,17 @@ have additional history gates layered on top.
 The two ballots are emitted from
 `connito/validator/run.py` right after `finalize_round_scores`:
 
-**Weight Group 1 — `cfg.weight_group_1_share` (default 98 %), top-3 of A ∪ B by aggregator avg:**
+**Weight Group 1 — `cfg.weight_group_1_share` (default 98 %), top-`cfg.weight_group_1_size` (default 3) of A ∪ B by aggregator avg:**
 
 - Local score-aggregator avg ranking, restricted to `A ∪ B`.
 - Miner must have **≥ 3** score records in the aggregator.
-- Miner must have a score recorded in **both** of the last 2 rounds:
-  one tagged with `round_id = current_round_id` and one tagged with
-  `round_id = current_round_id − cycle_length`. Missing either round
-  drops the miner off the Group 1 ballot for this cycle.
+- Miner must have scores recorded under **≥ 3 distinct `round_id`s
+  within the last `5 × cycle_length` blocks** — i.e. scored in at
+  least **3 of the last 5 cycles**. The window is
+  `[current_round_id − 5 × cycle_length, current_round_id]`. Multiple
+  records at the same `round_id` count as 1; the gate is on distinct
+  round_ids. See `count_distinct_round_ids_in_range` on
+  `MinerScoreAggregator`.
 - **Empty-Group-1 guard:** if no UID clears the gates, the 98 % share
   is redirected to `uid = 0` (subnet owner) rather than dropped.
   This keeps the validator's total emission at 100 % so its
@@ -154,9 +322,9 @@ The two ballots are emitted from
 - Local score-aggregator avg ranking, restricted to
   `A ∪ B ∪ C` minus the miners already on this validator's
   Group 1 ballot.
-- Miner must have **≥ 2** score records in the aggregator.
+- Miner must have **≥ 1** score record in the aggregator.
 - No recency requirement — Group 2 is the slow-rotating reward tier
-  and a miner with two old records still qualifies.
+  and a miner with a single recorded score still qualifies.
 
 These two ballots are what other validators see next cycle when
 computing **their** chain-set tallies — the loop that drives the
@@ -169,34 +337,48 @@ for 8+ cycles drops out of the upper tiers automatically.
 
 ---
 
-## The non-A/B/C tail — eval coverage for unranked miners
+## The non-A/B/C background extensions — eval coverage beyond the cohort
 
 A miner that is not selected into this validator's `A ∪ B ∪ C` for the
 cycle is **not excluded** from evaluation. `Round.freeze`
-(`connito/validator/round.py`) appends a tail to `background_uids`
-containing every miner with a chain checkpoint that did not land in
-the cohort roster.
+(`connito/validator/round.py`) extends `background_uids` with two
+extra tiers — a previous-round A/B carry-over followed by a staleness
+tail — so unranked and recently-rotated miners still get a chance to
+accumulate score history.
 
-Construction:
+Order of construction (`validator/round.py:408-440`):
 
-- **Pool** — `(miners with chain checkpoint) \\ (A ∪ B ∪ C ∪ foreground)`.
-  Foreground is already a subset of A ∪ B, so this is effectively
-  "everyone with a checkpoint outside the cohort".
-- **Order** — staleness desc (longest-since-last-evaluated first),
-  random tiebreak. Same ordering used for the legacy background
-  staleness tail.
-- **Placement** — appended after the A → B → C background segments.
-  Background workers (download + bg-eval) walk the queue in order, so
-  the tail runs only when the cohort roster is fully covered and there
-  is spare capacity left in the round.
+1. **A → B → C background segment** — `(A ∪ B ∪ C) \\ foreground`,
+   preserving A → B → C order. The consensus tier is processed first.
 
-Effect on promotion: tail miners earn score records exactly like
-Group C miners do, which is what feeds the ≥ 2 / ≥ 3 record thresholds
-above and the rolling avg that drives the next cycle's chain-set
-ballots. Without the tail, a miner that drops out of every validator's
-A ∪ B ∪ C for a cycle would have no opportunity to accumulate history
-and would be stuck — the tail keeps the C → B → A path open even when
-the seeded Group C partition does not pick them.
+2. **Previous-round A/B carry-over tier** — every UID that was in
+   the *previous* round's Group A or Group B but is not in this
+   round's `cohort_set` (i.e. dropped out of A ∪ B ∪ C or foreground).
+   Appended in (prev A, prev B) order. Within a cohort epoch where
+   A/B are unchanged, this dedupes to a no-op; at a cohort boundary
+   the previous epoch's leaders get one more eval pass before
+   rotating out, so the handoff does not drop their scores.
+
+3. **Staleness tail** — every other miner reachable through the
+   validator's foreground/background pool that is not already in
+   the cohort set or the carry-over tier.
+   - **Pool** — effectively `(reachable miners) \\ (A ∪ B ∪ C ∪ foreground ∪ prev_AB_carryover)`.
+   - **Order** — staleness desc (longest-since-last-evaluated first),
+     random tiebreak. Equal-staleness UIDs rotate naturally across
+     cycles.
+
+Background workers (download + bg-eval) walk the queue in order,
+so each extension runs only when the segments above it are fully
+covered and there is spare capacity left in the round.
+
+Effect on promotion: carry-over and tail miners earn score records
+exactly like Group C miners do, which is what feeds the ≥ 1 / ≥ 3
+record thresholds above and the rolling avg that drives the next
+cycle's chain-set ballots. Without these extensions, a miner that
+drops out of every validator's A ∪ B ∪ C for a cycle (or rotates
+out of A/B at a cohort boundary) would have no opportunity to
+accumulate history and would be stuck — they keep the C → B → A
+path open even when the seeded Group C partition does not pick them.
 
 ---
 
@@ -209,17 +391,18 @@ the seeded Group C partition does not pick them.
   are not evaluated and earn no reward (`Round.freeze` step 3).
 - **Hotkey rotation.** When a UID's hotkey changes,
   `MinerScoreAggregator.add_score` resets that UID's history. The
-  miner must re-accumulate the ≥ 3 / ≥ 2 record thresholds before it
+  miner must re-accumulate the ≥ 3 / ≥ 1 record thresholds before it
   can re-appear in weight Group 1 / 2.
 - **Validation failure.** Hash, signature, expert-group, or NaN/Inf
   failures during eval flag the UID in `validation_failed_uids`;
   `finalize_round_scores` writes `score = 0` for that round.
   Repeated failures pull the avg down and eventually push the miner
   out of the upper tiers via the chain-set tally.
-- **Stale aggregator.** A miner that misses **either** of the last
-  2 rounds fails the Group 1 recency gate and drops off this
-  validator's top-3 ballot for the cycle. Group 2 has no recency gate —
-  it only requires ≥ 2 records.
+- **Stale aggregator.** A miner that fails to record scores under
+  **≥ 3 distinct round_ids within the last `5 × cycle_length` blocks**
+  (3 of the last 5 cycles) fails the Group 1 recency gate and drops
+  off this validator's top-`weight_group_1_size` ballot for the cycle.
+  Group 2 has no recency gate — it only requires ≥ 1 record.
 
 ---
 
