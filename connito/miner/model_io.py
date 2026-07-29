@@ -1,3 +1,5 @@
+import fcntl
+import json
 import os
 import random
 from dataclasses import dataclass, field
@@ -31,6 +33,7 @@ from connito.shared.cycle import (
     PhaseResponse,
     check_phase_expired,
     get_allowed_version_range,
+    get_blocks_until_next_phase_from_api,
     wait_till,
 )
 from connito.shared.hf_distribute import (
@@ -130,15 +133,22 @@ def scheduler_service(
         if not skip_download:
             download_queue.put(Job(job_type=JobType.DOWNLOAD, phase_response=phase_response))
 
-        # --------- COMISSION SCHEDULING ---------
-        phase_response = wait_till(
+        # --------- COMMIT SCHEDULING ---------
+        # Enqueue the COMMIT job now, at the start of the cycle (Distribute).
+        # The commit worker prepares the checkpoint (rotation-model select +
+        # multi-GB hash) during the long Train phase that follows, then waits
+        # for the MinerCommit1 window itself and submits immediately — so the
+        # slow hash no longer eats the ~2-block commit window. The worker
+        # blocks on Train/MinerCommit1, which paces this loop to one job/cycle.
+        commit_queue.put(Job(job_type=JobType.COMMIT))
+
+        # Pace the loop: block until this cycle's MinerCommit1 window so we
+        # enqueue exactly one COMMIT per cycle. Without this, the next
+        # wait_till(Distribute) would return immediately (still in Distribute)
+        # and spin out a flood of jobs. The result is intentionally unused —
+        # the worker does its own wait_till(MinerCommit1).
+        wait_till(
             config, phase_name=PhaseNames.miner_commit_1, poll_fallback_block=poll_fallback_block
-        )
-        commit_queue.put(
-            Job(
-                job_type=JobType.COMMIT,
-                phase_response=phase_response,
-            )
         )
 
 
@@ -221,36 +231,145 @@ def download_worker(
 # through, one committed per cycle. Resolved as `../models` relative to the
 # project root (root_path is the repo dir; its parent holds `models/`).
 ROTATION_MODELS_DIRNAME = "models"
+# Shared, host-local file where concurrent miners reserve a distinct model for
+# the current cycle (see _claim_rotation_model). Lives in the same cache dir as
+# the cycle cache; gitignored.
+ROTATION_CLAIMS_FILENAME = "model_claims.json"
 
 
 def _rotation_models_dir(config) -> Path:
     return Path(config.run.root_path).parent / ROTATION_MODELS_DIRNAME
 
 
-def _list_rotation_models(models_dir: Path) -> list[Path]:
-    """Return the model repo subdirectories under `models_dir`, sorted by name
-    so the first cycle deterministically picks `model0` (the first entry).
+def _rotation_claims_path(config) -> Path:
+    return Path(config.run.root_path) / "cache" / ROTATION_CLAIMS_FILENAME
+
+
+def _list_rotation_models(models_dir: Path, group_id: int) -> list[Path]:
+    """Return the rotation model directories under `models_dir`, sorted by name.
+
+    Only directories that actually contain this expert group's shard
+    (`model_expgroup_{group_id}.safetensors` or `.pt`) qualify. This skips
+    non-model entries — hidden dirs like `.claude`/`.cache`, partial downloads,
+    or scratch folders — which would otherwise be selectable and produce a
+    broken commit (the upload matches no files, so the on-chain model_hash
+    wouldn't match what's on HF and the validator rejects it).
     """
     if not models_dir.exists():
         return []
-    return sorted(p for p in models_dir.iterdir() if p.is_dir())
+    shards = (f"model_expgroup_{group_id}.safetensors", f"model_expgroup_{group_id}.pt")
+    return sorted(
+        p for p in models_dir.iterdir()
+        if p.is_dir() and any((p / s).exists() for s in shards)
+    )
 
 
-def _select_rotation_model(models_dir: Path, previous: Path | None) -> Path:
+def _claim_rotation_model(
+    models: list[Path],
+    previous: Path | None,
+    *,
+    cycle_key: int,
+    hotkey: str,
+    claims_path: Path,
+) -> Path:
+    """Atomically reserve a distinct model for this cycle so concurrent miners on
+    the same host don't all commit the same model (validators may penalise
+    duplicate model hashes across hotkeys).
+
+    Coordination is a single JSON file guarded by an exclusive `flock`, keyed by
+    `cycle_key` (resets when the cycle rolls over). Each miner excludes models
+    already claimed by *other* hotkeys this cycle, then picks randomly from
+    what's left and records its own claim — all under the lock so the read,
+    decision and write are one atomic step across processes.
+
+    Guarantees a distinct pick per hotkey while the pool has >= as many models as
+    active miners. When the pool is smaller, a collision is unavoidable: it logs
+    a warning and falls back to a random pick.
+    """
+    claims_path.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" creates the file if missing and never truncates on open; we seek(0)
+    # to read and truncate explicitly before writing, all while holding LOCK_EX.
+    with open(claims_path, "a+", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                data = {}
+            if data.get("cycle_key") != cycle_key:
+                data = {"cycle_key": cycle_key, "claims": {}}
+            claims = data.setdefault("claims", {})
+
+            taken = {m for hk, m in claims.items() if hk != hotkey}
+            # Prefer a model that is neither last cycle's pick nor already claimed
+            # by another miner this cycle.
+            pool = [p for p in models if p != previous and p.name not in taken]
+            if not pool:  # everything non-previous is taken -> drop the previous-exclusion
+                pool = [p for p in models if p.name not in taken]
+            if not pool:  # more active miners than models -> collision unavoidable
+                logger.warning(
+                    "rotation pool smaller than active miners; duplicate commit unavoidable",
+                    models=len(models),
+                    claimed=len(taken),
+                    hotkey=hotkey,
+                )
+                pool = models
+            selected = random.choice(pool)
+
+            claims[hotkey] = selected.name
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f)
+            f.flush()
+            return selected
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _select_rotation_model(
+    models_dir: Path,
+    previous: Path | None,
+    group_id: int,
+    *,
+    cycle_key: int,
+    hotkey: str,
+    claims_path: Path,
+) -> Path:
     """Pick the model to commit this cycle: a random model, excluding the one
-    committed in the immediately previous cycle.
+    committed in the immediately previous cycle and any claimed by a sibling
+    miner this cycle (see _claim_rotation_model).
 
     First cycle (`previous is None`) is also random — nothing is excluded, so
     every model is a candidate. If only one model exists it is reused regardless.
     """
-    models = _list_rotation_models(models_dir)
+    models = _list_rotation_models(models_dir, group_id)
     if not models:
-        raise FileNotReadyError(f"No model directories under {models_dir}, skip commit.")
-    # previous is None on the first cycle -> `m != previous` keeps every model,
-    # so the first pick is random too. The `or models` fallback covers the
-    # single-model case where the only candidate is the previous one.
-    candidates = [m for m in models if m != previous] or models
-    return random.choice(candidates)
+        raise FileNotReadyError(
+            f"No model directories with a group-{group_id} shard under {models_dir}, skip commit."
+        )
+    return _claim_rotation_model(
+        models, previous, cycle_key=cycle_key, hotkey=hotkey, claims_path=claims_path
+    )
+
+
+def _upcoming_commit1_version(config) -> int | None:
+    """Start block of the NEXT MinerCommit1 window, from the phase API.
+
+    Used when preparing a checkpoint ahead of the window (during Train): the
+    schedule endpoint reports the upcoming MinerCommit1 start, which is exactly
+    the `phase_start_block` that `get_allowed_version_range` returns once the
+    window is actually open. Returns None if the API is unavailable, so the
+    caller can fall back to the in-window resolution.
+    """
+    schedule = get_blocks_until_next_phase_from_api(config)
+    if not schedule:
+        return None
+    entry = schedule.get(PhaseNames.miner_commit_1)
+    if not entry:
+        return None
+    return entry[0]
 
 
 def _prepare_checkpoint_for_commit(
@@ -258,23 +377,45 @@ def _prepare_checkpoint_for_commit(
     wallet,
     shared_state: SharedState,
     previous_model: Path | None,
+    commit1_version: int | None = None,
 ) -> tuple[ModelCheckpoint, Path]:
     """Select the next model from the rotation directory, sign its hash, and
     publish the path to shared state.
 
     Returns the signed checkpoint and the selected model directory (so the
     caller can exclude it from next cycle's random pick).
+
+    `commit1_version`, when given, is used as the version/dedup key instead of
+    resolving it from `get_allowed_version_range`. The commit worker prepares
+    the checkpoint DURING Train — before the MinerCommit1 window opens — so the
+    multi-GB hash is done ahead of time; at that point `get_allowed_version_range`
+    would return the *previous* cycle's MinerCommit1 start, so the caller passes
+    the *upcoming* MinerCommit1 start explicitly (same value validators use once
+    the window opens).
     """
     models_dir = _rotation_models_dir(config)
-    selected = _select_rotation_model(models_dir, previous_model)
 
     # Validators reject commits whose global_ver falls outside
     # [phase_start - version_range_cycles * cycle_length, phase_start]. The
     # rotated models carry no training version, so stamp them with the upper
-    # bound of that window (the current MinerCommit1 phase start block).
-    _min_ver, max_ver = get_allowed_version_range(config)
+    # bound of that window (the current MinerCommit1 phase start block). That same
+    # phase-start block is constant for the whole cycle and identical across all
+    # miners, so it doubles as the per-cycle key for cross-miner claim dedup.
+    if commit1_version is not None:
+        max_ver = commit1_version
+    else:
+        _min_ver, max_ver = get_allowed_version_range(config)
     if max_ver is None:
         raise FileNotReadyError("Could not resolve allowed version range, skip commit.")
+
+    selected = _select_rotation_model(
+        models_dir,
+        previous_model,
+        config.task.exp.group_id,
+        cycle_key=max_ver,
+        hotkey=config.chain.hotkey_ss58,
+        claims_path=_rotation_claims_path(config),
+    )
 
     latest_checkpoint = ModelCheckpoint(
         path=selected,
@@ -427,14 +568,22 @@ def commit_worker(
     wallet,
     shared_state: SharedState,
     subtensor=None,
+    commit_subtensor=None,
 ):
     """Consume COMMIT jobs. For each cycle: select the next model from the
     rotation directory and sign+publish its hash (miner_commit_1), upload to
     HF, then commit the hash+HF coords (miner_commit_2). Each step lives in its
     own helper for readability.
+
+    `subtensor` (archive) is used for reads/phase checks. `commit_subtensor` is
+    the node the commit extrinsics are SUBMITTED through: a fast lite (finney)
+    node, since archive-node inclusion can take minutes and push the commit past
+    the ~2-block MinerCommit2 window (the validator then can't score it).
     """
     if subtensor is None:
         subtensor = bittensor.Subtensor(config.chain.network)
+    if commit_subtensor is None:
+        commit_subtensor = subtensor
     # Model committed in the previous cycle, excluded from this cycle's random
     # pick. Advances on every successful selection so the rotation keeps moving.
     previous_model: Path | None = None
@@ -445,11 +594,21 @@ def commit_worker(
             logger.info(f"<{PhaseNames.miner_commit_1}> shutdown signal received.")
             return
         try:
+            # Prepare AHEAD of the window (during Train): rotation-model select
+            # + multi-GB hash. Stamp the version/dedup key with the UPCOMING
+            # MinerCommit1 start (the value validators use once the window is
+            # open); fall back to in-window resolution if the API is down.
+            upcoming_version = _upcoming_commit1_version(config)
             latest_checkpoint, previous_model = _prepare_checkpoint_for_commit(
-                config, wallet, shared_state, previous_model
+                config, wallet, shared_state, previous_model,
+                commit1_version=upcoming_version,
             )
-            _commit_signed_model_hash(config, wallet, subtensor, latest_checkpoint)
-            check_phase_expired(subtensor, job.phase_response)
+
+            # Now block until the window opens and submit immediately — the hash
+            # is already done, so the extrinsic lands in the first block(s).
+            phase_response = wait_till(config, PhaseNames.miner_commit_1)
+            _commit_signed_model_hash(config, wallet, commit_subtensor, latest_checkpoint)
+            check_phase_expired(subtensor, phase_response)
 
             # HF upload runs between the two commits so the revision is known
             # by the time we write miner_commit_2. Failure returns (None, None)
@@ -459,7 +618,7 @@ def commit_worker(
 
             phase_response = wait_till(config, PhaseNames.miner_commit_2)
             _commit_model_hash(
-                config, wallet, subtensor, latest_checkpoint,
+                config, wallet, commit_subtensor, latest_checkpoint,
                 hf_chain_repo_id, hf_revision,
             )
             check_phase_expired(subtensor, phase_response)
@@ -475,9 +634,11 @@ def commit_worker(
 
 
 # --- Wiring it all together ---
-def run_system(config, wallet, expert_manager, current_model_version: int = 0, current_model_hash: str = "xxx", subtensor=None):
+def run_system(config, wallet, expert_manager, current_model_version: int = 0, current_model_hash: str = "xxx", subtensor=None, commit_subtensor=None):
     if subtensor is None:
         subtensor = bittensor.Subtensor(config.chain.network)
+    if commit_subtensor is None:
+        commit_subtensor = subtensor
 
     download_queue = Queue()
     commit_queue = Queue()
@@ -497,7 +658,7 @@ def run_system(config, wallet, expert_manager, current_model_version: int = 0, c
         )
     commit_thread = Thread(
         target=commit_worker,
-        args=(config, commit_queue, wallet, shared_state, subtensor),
+        args=(config, commit_queue, wallet, shared_state, subtensor, commit_subtensor),
         daemon=False,
     )
 
@@ -548,8 +709,10 @@ if __name__ == "__main__":
     from connito.shared.cycle import apply_owner_url_override
     apply_owner_url_override(config)
 
-    wallet, subtensor, _lite_subtensor = setup_chain_worker(config)
+    wallet, subtensor, lite_subtensor = setup_chain_worker(config)
 
     expert_manager = ExpertManager(config)
 
-    run_system(config, wallet, expert_manager, subtensor=subtensor)
+    # Submit commit extrinsics through the fast lite (finney) node; the archive
+    # node's slow inclusion was pushing commits past the MinerCommit2 window.
+    run_system(config, wallet, expert_manager, subtensor=subtensor, commit_subtensor=lite_subtensor)
