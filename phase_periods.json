@@ -1,9 +1,9 @@
 {
-  "_comment": "Owner LIVE cycle periods, derived from /blocks_until_next_phase (cycle_length=524). Re-sync from the owner API whenever the schedule changes. Repo defaults differ: commit_period 10, submission_period 80.",
+  "_comment": "Owner LIVE cycle periods, derived from / (cycle_length=524). Re-sync from the owner API whenever the schedule changes. Repo defaults differ: train_period 300, commit_period 10, submission_period 80.",
   "distribute_period": 20,
-  "train_period": 300,
+  "train_period": 340,
   "commit_period": 11,
-  "submission_period": 100,
+  "submission_period": 60,
   "validate_period": 10,
   "merge_period": 50
 }

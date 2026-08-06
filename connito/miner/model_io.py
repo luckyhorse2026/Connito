@@ -238,7 +238,14 @@ ROTATION_CLAIMS_FILENAME = "model_claims.json"
 
 
 def _rotation_models_dir(config) -> Path:
-    return Path(config.run.root_path).parent / ROTATION_MODELS_DIRNAME
+    # .resolve() BEFORE .parent: the config writer relativizes paths on save, so
+    # run.root_path is typically stored as '.' — and Path('.').parent is '.',
+    # which collapses the intended '../models' to './models' (a nonexistent dir
+    # inside the repo) and makes every commit skip with "No group-N shard".
+    # Resolving against the CWD (the repo dir, per ecosystem `cwd: REPO`) yields
+    # the absolute repo path so .parent correctly climbs to its parent, where
+    # the rotation pool lives. Works whether root_path is '.' or already absolute.
+    return Path(config.run.root_path).resolve().parent / ROTATION_MODELS_DIRNAME
 
 
 def _rotation_claims_path(config) -> Path:
