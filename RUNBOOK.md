@@ -182,18 +182,40 @@ export CONNITO_MODEL_CLAIMS=/path/to/sn102-connitor/Connito/cache/model_claims.j
 
 ## 4. Start Connito with PM2
 
+Run everything under **PM2** via `ecosystem.config.js`. Do **not** run
+`connito-phase-server` (or miners) as a raw `python3 -m …` in a terminal —
+PM2 owns restarts, logs, and boot persistence.
+
+### Full fleet (phase server + all miners)
+
 ```bash
 cd /path/to/sn102-connitor/Connito
 export HF_TOKEN=hf_xxx          # required for Commit1 HF upload
 
 pm2 start ecosystem.config.js
-pm2 save
+pm2 save                        # persist across reboot (with pm2 startup)
 ```
 
 Starts:
 
-- `connito-phase-server` — `0.0.0.0:8088`
+- `connito-phase-server` — local phase API on `0.0.0.0:8088` (must be up before miners are useful)
 - `connito-miner-h00000` … (one per hotkey)
+
+### Phase server only (PM2)
+
+Defined as the `server` app in `ecosystem.config.js`. Prefer starting the full
+ecosystem; to (re)start just the phase server after it is already registered:
+
+```bash
+cd /path/to/sn102-connitor/Connito
+pm2 start ecosystem.config.js --only connito-phase-server   # first time / if missing
+pm2 restart connito-phase-server
+pm2 logs connito-phase-server --lines 50
+```
+
+Miners point at it with `CONNITO_OWNER_URL=http://127.0.0.1:8088` (set in the
+ecosystem miner `env`). If the phase server is down, miners cannot get a
+correct schedule.
 
 Miner env (set in ecosystem):
 
@@ -212,9 +234,11 @@ pm2 logs connito-phase-server --lines 50
 pm2 logs connito-miner-h00000 --lines 80
 pm2 restart ecosystem.config.js
 # or: pm2 restart connito-phase-server connito-miner-h00000 ...
+pm2 stop connito-phase-server          # stop phase server only
+pm2 stop ecosystem.config.js           # stop all Connito apps in the file
 ```
 
-Smoke-check phase server:
+Smoke-check phase server (after PM2 shows it online):
 
 ```bash
 curl -sS http://127.0.0.1:8088/ | head -c 400
